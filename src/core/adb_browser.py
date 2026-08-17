@@ -94,7 +94,6 @@ class AdbBrowser:
 
     def _find_adb(self) -> str:
         """Find ADB executable."""
-        # Check common locations
         paths = [
             "adb",
             os.path.expanduser("~/Android/Sdk/platform-tools/adb"),
@@ -103,15 +102,21 @@ class AdbBrowser:
             ),
             r"C:\platform-tools\adb.exe",
             r"C:\Android\platform-tools\adb.exe",
+            r"C:\Android\adb.exe",
             "/usr/local/bin/adb",
             "/usr/bin/adb",
         ]
 
         for path in paths:
             try:
-                result = subprocess.run(
-                    [path, "version"], capture_output=True, text=True, timeout=5
-                )
+                kwargs = {"capture_output": True, "text": True, "timeout": 5}
+                if os.name == "nt":
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    si.wShowWindow = 0
+                    kwargs["startupinfo"] = si
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                result = subprocess.run([path, "version"], **kwargs)
                 if result.returncode == 0:
                     return path
             except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
@@ -123,10 +128,14 @@ class AdbBrowser:
     def adb_available(self) -> bool:
         """Check if ADB is installed."""
         try:
-            r = subprocess.run(
-                [self._adb_path, "version"],
-                capture_output=True, text=True, timeout=5
-            )
+            kwargs = {"capture_output": True, "text": True, "timeout": 5}
+            if os.name == "nt":
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = 0
+                kwargs["startupinfo"] = si
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            r = subprocess.run([self._adb_path, "version"], **kwargs)
             return r.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             return False
@@ -187,14 +196,23 @@ class AdbBrowser:
         self._device_serial = None
 
     def _run_adb(self, *args, timeout: int = 30) -> Optional[str]:
-        """Run an ADB command."""
+        """Run an ADB command (hidden window on Windows)."""
         cmd = [self._adb_path]
         if self._device_serial:
             cmd += ["-s", self._device_serial]
         cmd += list(args)
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            # Hide console window on Windows
+            kwargs = {"capture_output": True, "text": True, "timeout": timeout}
+            if os.name == "nt":
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = 0  # SW_HIDE
+                kwargs["startupinfo"] = si
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+            result = subprocess.run(cmd, **kwargs)
             if result.returncode == 0:
                 return result.stdout
             return None
@@ -209,85 +227,116 @@ class AdbBrowser:
     def list_directory(self, path: str = "/sdcard") -> List[PhoneFile]:
         """
         List files and folders in a directory on the phone.
-        Uses multiple fallback methods to handle all Android versions.
+        Uses simple, reliable approach that works on ALL Android versions.
         """
         if not self._connected:
             return []
 
         entries = []
 
-        # METHOD 1: Use 'ls -1' for names + check type with test -d
-        # Most reliable across all Android versions
-        output = self._run_shell(f'ls -1 "{path}" 2>/dev/null', timeout=60)
+        # Use 'ls -la' — the most widely supported listing command
+        # Parse permissively: first char 'd' = dir, otherwise file
+        # Get size from whichever numeric column makes sense
+        output = self._run_shell(f'ls -la "{path}"', timeout=60)
 
         if not output:
-            # Try without quotes
-            output = self._run_shell(f'ls -1 {path} 2>/dev/null', timeout=60)
-
+            output = self._run_shell(f'ls -la {path}', timeout=60)
         if not output:
+            # Last resort: just names
+            output = self._run_shell(f'ls "{path}"', timeout=60)
+            if output:
+                for name in output.split("\n"):
+                    name = name.strip()
+                    if name and not name.startswith("."):
+                        entries.append(PhoneFile(
+                            name=name, path=f"{path}/{name}",
+                            is_dir=False, size=0
+                        ))
+                entries.sort(key=lambda e: e.name.lower())
+                return entries
             return []
 
-        names = [n.strip() for n in output.split("\n") if n.strip()]
+        for line in output.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("total"):
+                continue
 
-        # Filter hidden and system
-        names = [n for n in names if not n.startswith(".")]
+            # First character determines type
+            is_dir = line.startswith("d")
 
-        # Batch check: which are directories?
-        # Use 'stat' or 'test -d' for each
-        # For efficiency, use a single shell command that outputs "d filename" or "f filename"
-        if names:
-            # Build a script that checks each file
-            # This handles up to ~500 names efficiently
-            batch_size = 200
-            for batch_start in range(0, len(names), batch_size):
-                batch_names = names[batch_start:batch_start + batch_size]
+            # Split into parts — name is ALWAYS the last portion
+            # The challenge: name might have spaces
+            # Strategy: split by whitespace, find the last numeric field (size),
+            # everything after date/time is the filename
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+
+            # Find the filename: it's after the date+time fields
+            # On Android ls -la, format is typically:
+            # perms links owner group size date time name
+            # OR: perms links owner group size date name
+            # We find the size (largest number before the name) and take everything after date/time
+            
+            # Simple approach: try to find name by looking for the date pattern
+            # Date patterns: "2024-01-15" or "Jan 15" or "2024-01-15 10:30"
+            name = None
+            size = 0
+            
+            # Try splitting with max 7 fields (standard ls -la)
+            try:
+                # Look for size as the number before date
+                # Walk backwards from end to find the name
+                # Name = everything after the last time/date field
                 
-                # Build check script
-                checks = []
-                for name in batch_names:
-                    safe_name = name.replace('"', '\\"').replace('$', '\\$')
-                    checks.append(
-                        f'if [ -d "{path}/{safe_name}" ]; then '
-                        f'echo "D|{safe_name}|0"; '
-                        f'else '
-                        f's=$(stat -c %s "{path}/{safe_name}" 2>/dev/null || echo 0); '
-                        f'echo "F|{safe_name}|$s"; '
-                        f'fi'
-                    )
+                # Method: find position of first date-like field, name is after time
+                for i in range(4, min(8, len(parts))):
+                    # Check if this looks like a size (number)
+                    try:
+                        possible_size = int(parts[i])
+                        # Next fields should be date — and rest is name
+                        # Take everything from i+2 or i+3 onwards as name
+                        if i + 2 < len(parts):
+                            # Check if parts[i+1] looks like a date
+                            remaining_start = i + 2
+                            # If there's also a time field, skip it
+                            if i + 3 <= len(parts) and ":" in parts[i + 2]:
+                                remaining_start = i + 3
+                            elif i + 2 < len(parts) and len(parts[i+1]) >= 8:
+                                remaining_start = i + 2
+                            
+                            if remaining_start < len(parts):
+                                name = " ".join(parts[remaining_start:])
+                                size = possible_size
+                                break
+                    except ValueError:
+                        continue
+            except (IndexError, ValueError):
+                pass
 
-                script = "; ".join(checks)
-                result = self._run_shell(script, timeout=60)
+            # Fallback: just take the last part as name
+            if not name:
+                name = parts[-1]
 
-                if result:
-                    for line in result.split("\n"):
-                        line = line.strip()
-                        if not line or "|" not in line:
-                            continue
-                        parts = line.split("|", 2)
-                        if len(parts) < 3:
-                            continue
-                        file_type = parts[0]
-                        name = parts[1]
-                        try:
-                            size = int(parts[2])
-                        except ValueError:
-                            size = 0
+            # Clean up name
+            name = name.strip()
+            if name.endswith("/"):
+                name = name[:-1]
+                is_dir = True
 
-                        entries.append(PhoneFile(
-                            name=name,
-                            path=f"{path}/{name}",
-                            is_dir=(file_type == "D"),
-                            size=size if file_type == "F" else 0
-                        ))
-                else:
-                    # Fallback: just add names without size info
-                    for name in batch_names:
-                        entries.append(PhoneFile(
-                            name=name,
-                            path=f"{path}/{name}",
-                            is_dir=False,  # Can't determine
-                            size=0
-                        ))
+            # Skip . and ..
+            if name in (".", ".."):
+                continue
+            # Skip hidden
+            if name.startswith("."):
+                continue
+
+            entries.append(PhoneFile(
+                name=name,
+                path=f"{path}/{name}",
+                is_dir=is_dir,
+                size=size if not is_dir else 0
+            ))
 
         # Sort: folders first, then files
         entries.sort(key=lambda e: (not e.is_dir, e.name.lower()))
@@ -341,6 +390,7 @@ class AdbBrowser:
         """
         Pull entire folder recursively from phone to PC.
         Uses adb pull which handles the recursion natively.
+        Window is HIDDEN (no CMD popup).
         """
         # Create local directory matching phone structure
         folder_name = os.path.basename(remote_path)
@@ -353,10 +403,21 @@ class AdbBrowser:
             cmd += ["-s", self._device_serial]
         cmd += ["pull", remote_path + "/.", local_dest]
 
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1
-        )
+        # Hide window on Windows
+        kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "bufsize": 1
+        }
+        if os.name == "nt":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0
+            kwargs["startupinfo"] = si
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        process = subprocess.Popen(cmd, **kwargs)
 
         # Parse adb pull output for progress
         # Output lines like: "/sdcard/DCIM/photo.jpg": 1 file pulled, 0 skipped. 45.2 MB/s
