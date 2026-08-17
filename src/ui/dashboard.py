@@ -84,8 +84,9 @@ class PreviewWindow(ctk.CTkToplevel):
         )
         self.next_btn.pack(side="right", padx=10, pady=8)
 
-        # Image display
-        self.image_label = ctk.CTkLabel(self, text="Loading...", fg_color="#000000")
+        # Image display (use tk.Label for reliable PhotoImage support)
+        self.image_label = tk.Label(self, text="Loading...", bg="#000000",
+                                    fg="#ffffff", font=("Segoe UI", 14))
         self.image_label.pack(fill="both", expand=True)
 
         # Keyboard bindings
@@ -111,14 +112,14 @@ class PreviewWindow(ctk.CTkToplevel):
         elif ext in VIDEO_EXTS:
             self.image_label.configure(
                 text=f"🎬 {f.name}\n\nVideo preview not available\nTransfer to PC to play",
-                font=ctk.CTkFont(size=16)
+                image=""
             )
         else:
-            self.image_label.configure(text=f.name)
+            self.image_label.configure(text=f.name, image="")
 
     def _load_image(self, f: 'PhoneFile'):
         """Pull and display image."""
-        self.image_label.configure(text="Loading...", image=None)
+        self.image_label.configure(text="Loading...", image="")
 
         def do_load():
             local = self.adb.pull_thumbnail(f.path, THUMB_CACHE)
@@ -133,18 +134,18 @@ class PreviewWindow(ctk.CTkToplevel):
         """Show image scaled to fit window."""
         try:
             img = Image.open(local_path)
-            # Scale to fit
-            w, h = self.winfo_width() - 20, self.winfo_height() - 80
-            if w < 100: w = 800
-            if h < 100: h = 550
+            # Scale to fit window
+            w = self.winfo_width() - 20
+            h = self.winfo_height() - 80
+            if w < 200: w = 850
+            if h < 200: h = 550
             img.thumbnail((w, h), Image.LANCZOS)
 
-            photo = ctk.CTkImage(light_image=img, dark_image=img,
-                                 size=(img.width, img.height))
-            self._photo = photo  # Keep reference
-            self.image_label.configure(image=photo, text="")
+            # Use raw PhotoImage (more reliable than CTkImage for large images)
+            self._photo = ImageTk.PhotoImage(img)
+            self.image_label.configure(image=self._photo, text="")
         except Exception as e:
-            self.image_label.configure(text=f"Cannot display: {e}")
+            self.image_label.configure(text=f"Cannot display: {e}", image=None)
 
     def _next(self):
         if self.index < len(self.files) - 1:
@@ -294,9 +295,17 @@ class FileExplorer(ctk.CTkFrame):
             self._add_item(i, entry)
 
     def _add_item(self, index: int, entry: PhoneFile):
-        """Add one file/folder entry — modern style."""
+        """Add one file/folder entry with inline thumbnail for images."""
+        ext_lower = ("." + entry.name.rsplit(".", 1)[-1].lower()) if "." in entry.name else ""
+        is_image = ext_lower in IMAGE_EXTS
+        is_video = ext_lower in VIDEO_EXTS
+        is_media = is_image or is_video
+
+        # Taller row for images to fit thumbnail
+        row_height = 50 if is_image else 38
+
         frame = ctk.CTkFrame(
-            self.file_list, height=38, corner_radius=8,
+            self.file_list, height=row_height, corner_radius=8,
             fg_color="#161b22", border_width=1, border_color="#21262d"
         )
         frame.pack(fill="x", pady=2, padx=2)
@@ -313,29 +322,33 @@ class FileExplorer(ctk.CTkFrame):
         cb.pack(side="left", padx=(6, 2))
         self._checkboxes.append((var, cb))
 
-        # Icon + Name
-        if entry.is_dir:
-            icon = "📁"
-            color = ACCENT_BLUE
-            font = ctk.CTkFont(size=12, weight="bold")
+        # Thumbnail or icon
+        if is_image:
+            # Show placeholder, load thumbnail in background
+            thumb_label = ctk.CTkLabel(frame, text="🖼️", width=44, height=44)
+            thumb_label.pack(side="left", padx=4)
+            # Load thumbnail async
+            threading.Thread(
+                target=self._load_thumbnail,
+                args=(entry, thumb_label, 40),
+                daemon=True
+            ).start()
+        elif is_video:
+            ctk.CTkLabel(frame, text="🎬", width=28, font=ctk.CTkFont(size=16)).pack(side="left", padx=4)
+        elif entry.is_dir:
+            ctk.CTkLabel(frame, text="📁", width=28, font=ctk.CTkFont(size=16)).pack(side="left", padx=4)
         else:
             ext = entry.name.rsplit(".", 1)[-1].lower() if "." in entry.name else ""
             icons = {
-                "jpg": "🖼️", "jpeg": "🖼️", "png": "🖼️", "heic": "🖼️", "webp": "🖼️",
-                "mp4": "🎬", "avi": "🎬", "mkv": "🎬", "mov": "🎬", "3gp": "🎬",
                 "mp3": "🎵", "wav": "🎵", "flac": "🎵", "m4a": "🎵",
-                "pdf": "📄", "doc": "📄", "docx": "📄", "txt": "📄",
+                "pdf": "📄", "doc": "📄", "docx": "📄", "txt": "📝",
                 "zip": "📦", "rar": "📦", "7z": "📦", "apk": "📱",
             }
-            icon = icons.get(ext, "📎")
-            color = TEXT_PRIMARY
-            font = ctk.CTkFont(size=12)
+            ctk.CTkLabel(frame, text=icons.get(ext, "📎"), width=28).pack(side="left", padx=4)
 
-        ctk.CTkLabel(frame, text=icon, width=22).pack(side="left", padx=2)
-
-        # Detect if this is a previewable media file
-        ext_lower = ("." + entry.name.rsplit(".", 1)[-1].lower()) if "." in entry.name else ""
-        is_media = ext_lower in IMAGE_EXTS or ext_lower in VIDEO_EXTS
+        # Name (clickable for folders and media)
+        color = ACCENT_BLUE if entry.is_dir else TEXT_PRIMARY
+        font = ctk.CTkFont(size=12, weight="bold") if entry.is_dir else ctk.CTkFont(size=12)
 
         name_label = ctk.CTkLabel(
             frame, text=entry.name, font=font,
@@ -357,6 +370,30 @@ class FileExplorer(ctk.CTkFrame):
             ).pack(side="right", padx=6)
 
         self._item_widgets.append(frame)
+
+    def _load_thumbnail(self, entry: PhoneFile, label: ctk.CTkLabel, size: int):
+        """Pull image from phone and set as thumbnail on the label."""
+        try:
+            if not self.adb:
+                return
+            local = self.adb.pull_thumbnail(entry.path, THUMB_CACHE)
+            if not local:
+                return
+            img = Image.open(local)
+            img.thumbnail((size, size), Image.LANCZOS)
+            photo = ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
+            # Update label on main thread
+            label.after(0, lambda: self._set_thumb(label, photo))
+        except Exception:
+            pass
+
+    def _set_thumb(self, label: ctk.CTkLabel, photo):
+        """Set thumbnail image on label (must run on main thread)."""
+        try:
+            label.configure(image=photo, text="")
+            label._thumb_ref = photo  # Keep reference to prevent GC
+        except Exception:
+            pass
 
     def _toggle(self, index: int, var):
         if var.get():
