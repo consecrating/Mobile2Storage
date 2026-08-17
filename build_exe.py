@@ -43,6 +43,7 @@ a = Analysis(
     hiddenimports=[
         "src",
         "src.core",
+        "src.core.adb_browser",
         "src.core.receiver_server",
         "src.core.mobile_page",
         "src.core.qr_generator",

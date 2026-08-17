@@ -1,14 +1,10 @@
 """
-Mobile2Storage - PC Dashboard with Remote File Explorer.
+Mobile2Storage - PC Dashboard.
+Two connection modes:
+1. USB (ADB) — fastest, most reliable, browse files directly from PC
+2. WiFi (QR code) — no cable needed, phone grants access via browser
 
-Architecture:
-- Phone grants storage access (one tap)
-- PC shows a FILE EXPLORER of the phone's files
-- User browses and selects folders/files FROM THE PC
-- PC requests transfers — phone sends them over WiFi
-
-The phone never processes or displays large file lists.
-All heavy lifting done on the PC side.
+Both modes show a FILE EXPLORER on the PC side.
 """
 
 import customtkinter as ctk
@@ -19,9 +15,9 @@ import time
 import os
 from typing import Optional, List
 
+from ..core.adb_browser import AdbBrowser, PhoneFile, AdbTransferProgress
 from ..core.receiver_server import (
-    ReceiverServer, ServerStats, FileTransfer,
-    get_local_ip, find_free_port
+    ReceiverServer, ServerStats, get_local_ip, find_free_port
 )
 from ..core.mobile_page import MOBILE_PAGE_HTML
 from ..core.qr_generator import generate_qr_for_tkinter
@@ -43,277 +39,266 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 
-class PhoneFileExplorer(ctk.CTkFrame):
+class FileExplorer(ctk.CTkFrame):
     """
-    File explorer that browses the phone's files remotely.
-    Folders load on-demand (only when you click into them).
+    File explorer showing phone files.
+    Works with ADB browser for direct file listing.
     """
 
-    def __init__(self, parent, server: ReceiverServer, **kwargs):
+    def __init__(self, parent, **kwargs):
         kwargs.setdefault("corner_radius", 12)
         kwargs.setdefault("fg_color", CARD_BG)
         super().__init__(parent, **kwargs)
-        
-        self.server = server
-        self.current_path = ""
-        self._selected_items = set()
-        self._current_entries = []
+
+        self.adb: Optional[AdbBrowser] = None
+        self.current_path = "/sdcard"
+        self._entries: List[PhoneFile] = []
+        self._selected: set = set()  # indices of selected entries
         self._item_widgets = []
-        
+        self._checkboxes = []
+
         self._build_ui()
 
     def _build_ui(self):
-        # Header with path breadcrumb
+        # Header
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=12, pady=(10, 5))
+        header.pack(fill="x", padx=12, pady=(10, 4))
 
         ctk.CTkLabel(
-            header, text="📱 Phone Files",
+            header, text="📱 Phone Storage",
             font=ctk.CTkFont(size=14, weight="bold")
         ).pack(side="left")
 
         self.path_label = ctk.CTkLabel(
-            header, text="/",
-            font=ctk.CTkFont(size=11),
+            header, text="/sdcard",
+            font=ctk.CTkFont(family="Consolas", size=10),
             text_color=TEXT_SECONDARY
         )
         self.path_label.pack(side="right")
 
-        # Navigation buttons
+        # Navigation
         nav = ctk.CTkFrame(self, fg_color="transparent")
         nav.pack(fill="x", padx=12, pady=4)
 
         self.back_btn = ctk.CTkButton(
-            nav, text="⬅ Back", width=70, height=28,
-            command=self._go_back, corner_radius=8,
+            nav, text="⬅ Back", width=65, height=26,
+            command=self._go_back, corner_radius=6,
             font=ctk.CTkFont(size=11)
         )
-        self.back_btn.pack(side="left", padx=(0, 5))
+        self.back_btn.pack(side="left", padx=(0, 4))
+
+        self.home_btn = ctk.CTkButton(
+            nav, text="🏠", width=30, height=26,
+            command=self._go_home, corner_radius=6
+        )
+        self.home_btn.pack(side="left", padx=(0, 4))
 
         self.refresh_btn = ctk.CTkButton(
-            nav, text="🔄 Refresh", width=80, height=28,
-            command=self._refresh, corner_radius=8,
-            font=ctk.CTkFont(size=11)
+            nav, text="🔄", width=30, height=26,
+            command=lambda: self.load_directory(self.current_path),
+            corner_radius=6
         )
-        self.refresh_btn.pack(side="left", padx=(0, 5))
+        self.refresh_btn.pack(side="left", padx=(0, 8))
 
         self.select_all_btn = ctk.CTkButton(
-            nav, text="☑ Select All", width=90, height=28,
-            command=self._select_all, corner_radius=8,
+            nav, text="☑ All", width=50, height=26,
+            command=self._select_all, corner_radius=6,
             font=ctk.CTkFont(size=11)
         )
         self.select_all_btn.pack(side="left")
 
-        self.selection_label = ctk.CTkLabel(
+        self.sel_label = ctk.CTkLabel(
             nav, text="", font=ctk.CTkFont(size=11),
             text_color=ACCENT_GREEN
         )
-        self.selection_label.pack(side="right")
+        self.sel_label.pack(side="right")
 
-        # File list (scrollable)
+        # File list
         self.file_list = ctk.CTkScrollableFrame(
             self, fg_color="transparent",
             scrollbar_button_color=TEXT_DIM
         )
         self.file_list.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
-        # Loading / empty state
         self.state_label = ctk.CTkLabel(
-            self.file_list, text="Waiting for phone to connect...",
-            font=ctk.CTkFont(size=13), text_color=TEXT_DIM
+            self.file_list, text="Connect your phone to browse files",
+            font=ctk.CTkFont(size=12), text_color=TEXT_DIM
         )
-        self.state_label.pack(pady=30)
+        self.state_label.pack(pady=40)
 
-    def load_directory(self, path: str = ""):
-        """Load a directory listing from the phone."""
+    def load_directory(self, path: str):
+        """Load and display a directory."""
+        if not self.adb or not self.adb.is_connected:
+            return
+
         self.current_path = path
-        self.path_label.configure(text="/" + path if path else "/")
-        self._selected_items.clear()
-        self._update_selection_label()
+        self.path_label.configure(text=path)
+        self._selected.clear()
+        self._update_sel_label()
 
-        # Show loading state
-        self._clear_items()
+        # Show loading
+        self._clear()
         self.state_label.configure(text="Loading...")
-        self.state_label.pack(pady=30)
+        self.state_label.pack(pady=40)
 
-        # Load in background thread
         def do_load():
-            result = self.server.list_phone_directory(path)
-            self.after(0, lambda: self._display_entries(result))
+            entries = self.adb.list_directory(path)
+            self.after(0, lambda: self._show_entries(entries))
 
         threading.Thread(target=do_load, daemon=True).start()
 
-    def _display_entries(self, result: dict):
-        """Display directory entries."""
-        self._clear_items()
+    def _show_entries(self, entries: List[PhoneFile]):
+        """Display entries."""
+        self._clear()
         self.state_label.pack_forget()
-
-        entries = result.get("entries", [])
-        error = result.get("error", "")
-
-        if error:
-            self.state_label.configure(text=f"Error: {error}")
-            self.state_label.pack(pady=30)
-            return
+        self._entries = entries
 
         if not entries:
             self.state_label.configure(text="Empty folder")
-            self.state_label.pack(pady=30)
+            self.state_label.pack(pady=40)
             return
 
-        self._current_entries = entries
+        for i, entry in enumerate(entries):
+            self._add_item(i, entry)
 
-        for entry in entries:
-            self._add_entry_widget(entry)
-
-    def _add_entry_widget(self, entry: dict):
-        """Add a single file/folder entry to the list."""
-        name = entry["name"]
-        is_dir = entry["type"] == "dir"
-        size = entry.get("size", 0)
-
+    def _add_item(self, index: int, entry: PhoneFile):
+        """Add one file/folder entry."""
         frame = ctk.CTkFrame(
-            self.file_list, height=36, corner_radius=6,
+            self.file_list, height=34, corner_radius=5,
             fg_color="#1c2128"
         )
         frame.pack(fill="x", pady=1)
         frame.pack_propagate(False)
 
-        # Checkbox for selection
+        # Checkbox
         var = ctk.BooleanVar(value=False)
         cb = ctk.CTkCheckBox(
             frame, text="", variable=var,
-            width=24, height=24,
-            checkbox_width=18, checkbox_height=18,
-            corner_radius=4,
-            command=lambda n=name, v=var: self._toggle_select(n, v)
+            width=22, checkbox_width=16, checkbox_height=16,
+            corner_radius=3,
+            command=lambda idx=index, v=var: self._toggle(idx, v)
         )
-        cb.pack(side="left", padx=(8, 4))
+        cb.pack(side="left", padx=(6, 2))
+        self._checkboxes.append((var, cb))
 
-        # Icon
-        if is_dir:
+        # Icon + Name
+        if entry.is_dir:
             icon = "📁"
+            color = ACCENT_BLUE
+            font = ctk.CTkFont(size=12, weight="bold")
         else:
-            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-            icon_map = {
-                "jpg": "🖼️", "jpeg": "🖼️", "png": "🖼️", "heic": "🖼️",
-                "mp4": "🎬", "avi": "🎬", "mkv": "🎬", "mov": "🎬",
+            ext = entry.name.rsplit(".", 1)[-1].lower() if "." in entry.name else ""
+            icons = {
+                "jpg": "🖼️", "jpeg": "🖼️", "png": "🖼️", "heic": "🖼️", "webp": "🖼️",
+                "mp4": "🎬", "avi": "🎬", "mkv": "🎬", "mov": "🎬", "3gp": "🎬",
                 "mp3": "🎵", "wav": "🎵", "flac": "🎵", "m4a": "🎵",
                 "pdf": "📄", "doc": "📄", "docx": "📄", "txt": "📄",
-                "zip": "📦", "rar": "📦", "apk": "📱",
+                "zip": "📦", "rar": "📦", "7z": "📦", "apk": "📱",
             }
-            icon = icon_map.get(ext, "📎")
+            icon = icons.get(ext, "📎")
+            color = TEXT_PRIMARY
+            font = ctk.CTkFont(size=12)
 
-        icon_label = ctk.CTkLabel(frame, text=icon, width=24)
-        icon_label.pack(side="left", padx=2)
+        ctk.CTkLabel(frame, text=icon, width=22).pack(side="left", padx=2)
 
-        # Name (clickable for folders)
         name_label = ctk.CTkLabel(
-            frame, text=name,
-            font=ctk.CTkFont(size=12, weight="bold" if is_dir else "normal"),
-            text_color=ACCENT_BLUE if is_dir else TEXT_PRIMARY,
-            anchor="w", cursor="hand2" if is_dir else ""
+            frame, text=entry.name, font=font,
+            text_color=color, anchor="w",
+            cursor="hand2" if entry.is_dir else ""
         )
         name_label.pack(side="left", fill="x", expand=True, padx=4)
 
-        if is_dir:
-            name_label.bind("<Button-1>", lambda e, n=name: self._open_folder(n))
+        if entry.is_dir:
+            name_label.bind("<Button-1>", lambda e, p=entry.path: self.load_directory(p))
 
-        # Size (for files)
-        if not is_dir and size > 0:
+        # Size
+        if not entry.is_dir and entry.size > 0:
             ctk.CTkLabel(
-                frame, text=format_size(size),
-                font=ctk.CTkFont(size=10), text_color=TEXT_DIM, width=70
-            ).pack(side="right", padx=8)
+                frame, text=format_size(entry.size),
+                font=ctk.CTkFont(size=10), text_color=TEXT_DIM, width=65
+            ).pack(side="right", padx=6)
 
         self._item_widgets.append(frame)
 
-    def _open_folder(self, name: str):
-        """Navigate into a folder."""
-        new_path = f"{self.current_path}/{name}" if self.current_path else name
-        self.load_directory(new_path)
-
-    def _go_back(self):
-        """Navigate to parent folder."""
-        if "/" in self.current_path:
-            parent = self.current_path.rsplit("/", 1)[0]
-        else:
-            parent = ""
-        self.load_directory(parent)
-
-    def _refresh(self):
-        """Refresh current directory."""
-        self.load_directory(self.current_path)
-
-    def _toggle_select(self, name: str, var):
-        """Toggle file/folder selection."""
+    def _toggle(self, index: int, var):
         if var.get():
-            self._selected_items.add(name)
+            self._selected.add(index)
         else:
-            self._selected_items.discard(name)
-        self._update_selection_label()
+            self._selected.discard(index)
+        self._update_sel_label()
 
     def _select_all(self):
-        """Select all items in current view."""
-        self._selected_items = {e["name"] for e in self._current_entries}
-        self._update_selection_label()
-        # Refresh checkboxes
-        self._refresh()
+        all_selected = len(self._selected) == len(self._entries)
+        self._selected.clear()
+        if not all_selected:
+            self._selected = set(range(len(self._entries)))
+        # Update checkboxes
+        for i, (var, _) in enumerate(self._checkboxes):
+            var.set(i in self._selected)
+        self._update_sel_label()
 
-    def _update_selection_label(self):
-        """Update selection count display."""
-        count = len(self._selected_items)
-        if count > 0:
-            self.selection_label.configure(text=f"✓ {count} selected")
+    def _update_sel_label(self):
+        n = len(self._selected)
+        if n > 0:
+            # Calculate total size of selected
+            total = sum(
+                self._entries[i].size for i in self._selected
+                if not self._entries[i].is_dir
+            )
+            dirs = sum(1 for i in self._selected if self._entries[i].is_dir)
+            files = n - dirs
+            parts = []
+            if dirs: parts.append(f"{dirs} folders")
+            if files: parts.append(f"{files} files")
+            text = ", ".join(parts)
+            if total > 0:
+                text += f" ({format_size(total)})"
+            self.sel_label.configure(text=f"✓ {text}")
         else:
-            self.selection_label.configure(text="")
+            self.sel_label.configure(text="")
 
-    def _clear_items(self):
-        """Clear file list."""
+    def _go_back(self):
+        parent = os.path.dirname(self.current_path)
+        if parent and parent != self.current_path:
+            self.load_directory(parent)
+
+    def _go_home(self):
+        self.load_directory("/sdcard")
+
+    def _clear(self):
         for w in self._item_widgets:
             w.destroy()
         self._item_widgets.clear()
+        self._checkboxes.clear()
 
-    def get_selected_paths(self) -> List[str]:
-        """Get full paths of selected items."""
-        paths = []
-        for name in self._selected_items:
-            if self.current_path:
-                paths.append(f"{self.current_path}/{name}")
-            else:
-                paths.append(name)
-        return paths
-
-    def get_selected_count(self) -> int:
-        return len(self._selected_items)
+    def get_selected_items(self) -> List[PhoneFile]:
+        """Get selected PhoneFile items."""
+        return [self._entries[i] for i in self._selected if i < len(self._entries)]
 
 
 class DashboardApp(ctk.CTk):
     """
-    PC Dashboard with remote phone file explorer.
-    Browse phone files from PC → select → transfer.
+    Main app with USB (ADB) + WiFi connection options.
     """
 
     def __init__(self):
         super().__init__()
 
         self.title("Mobile2Storage ⚡")
-        self.geometry("850x700")
-        self.minsize(750, 600)
+        self.geometry("900x700")
+        self.minsize(800, 600)
         self.configure(fg_color=DARK_BG)
 
+        # Core
+        self.adb = AdbBrowser()
         self._server: Optional[ReceiverServer] = None
-        self._server_thread: Optional[threading.Thread] = None
         self._destination = os.path.join(os.path.expanduser("~"), "Desktop", "Mobile2Storage")
-        self._server_url = ""
-        self._phone_connected = False
         self._transferring = False
 
         self._build_ui()
-        self.after(500, self._start_server)
 
     def _build_ui(self):
-        # HEADER
+        # === HEADER ===
         header = ctk.CTkFrame(self, height=50, fg_color=CARD_BG, corner_radius=0)
         header.pack(fill="x")
         header.pack_propagate(False)
@@ -323,231 +308,316 @@ class DashboardApp(ctk.CTk):
             font=ctk.CTkFont(size=18, weight="bold")
         ).pack(side="left", padx=15, pady=10)
 
-        self.connection_badge = ctk.CTkLabel(
-            header, text="● Phone not connected",
+        self.status_label = ctk.CTkLabel(
+            header, text="● Not connected",
             font=ctk.CTkFont(size=11), text_color=ACCENT_ORANGE
         )
-        self.connection_badge.pack(side="left", padx=10)
+        self.status_label.pack(side="left", padx=10)
 
-        # Destination
+        # Destination button
         self.dest_btn = ctk.CTkButton(
             header, text=f"📂 {os.path.basename(self._destination)}",
             command=self._change_destination,
-            width=140, height=28, corner_radius=8,
+            width=150, height=28, corner_radius=8,
             font=ctk.CTkFont(size=11)
         )
         self.dest_btn.pack(side="right", padx=15)
 
-        # MAIN AREA
+        # === MAIN AREA ===
         main = ctk.CTkFrame(self, fg_color="transparent")
         main.pack(fill="both", expand=True, padx=12, pady=10)
 
-        # Left: QR + Instructions (narrow)
-        left = ctk.CTkFrame(main, fg_color=CARD_BG, corner_radius=12, width=260)
+        # Left panel: Connection
+        left = ctk.CTkFrame(main, fg_color=CARD_BG, corner_radius=12, width=270)
         left.pack(side="left", fill="y", padx=(0, 8))
         left.pack_propagate(False)
 
-        ctk.CTkLabel(
-            left, text="📱 Connect Phone",
-            font=ctk.CTkFont(size=14, weight="bold")
-        ).pack(padx=12, pady=(12, 5), anchor="w")
+        self._build_connection_panel(left)
 
-        # QR code
-        self.qr_label = ctk.CTkLabel(left, text="Starting...")
-        self.qr_label.pack(padx=12, pady=5)
-
-        self.url_label = ctk.CTkLabel(
-            left, text="", font=ctk.CTkFont(size=10),
-            text_color=ACCENT_BLUE, wraplength=230
-        )
-        self.url_label.pack(padx=12, pady=2)
-
-        # Instructions
-        steps_frame = ctk.CTkFrame(left, fg_color="#0d1a26", corner_radius=8)
-        steps_frame.pack(fill="x", padx=12, pady=10)
-
-        for step in [
-            "1. Scan QR with phone camera",
-            "2. Tap 'Grant Storage Access'",
-            "3. Browse & transfer from here ➡️"
-        ]:
-            ctk.CTkLabel(
-                steps_frame, text=step,
-                font=ctk.CTkFont(size=11), anchor="w",
-                text_color=TEXT_SECONDARY
-            ).pack(fill="x", padx=10, pady=2)
-
-        # Right: File Explorer + Transfer button
+        # Right panel: File Explorer + Transfer
         right = ctk.CTkFrame(main, fg_color="transparent")
         right.pack(side="right", fill="both", expand=True)
 
-        # File explorer (takes most space)
-        self.explorer = PhoneFileExplorer(right, None)  # Server set later
+        # File Explorer
+        self.explorer = FileExplorer(right)
         self.explorer.pack(fill="both", expand=True, pady=(0, 8))
 
-        # Transfer button + progress
-        bottom = ctk.CTkFrame(right, fg_color=CARD_BG, corner_radius=12, height=100)
+        # Transfer controls
+        bottom = ctk.CTkFrame(right, fg_color=CARD_BG, corner_radius=12, height=90)
         bottom.pack(fill="x")
         bottom.pack_propagate(False)
 
         btn_row = ctk.CTkFrame(bottom, fg_color="transparent")
-        btn_row.pack(fill="x", padx=12, pady=10)
+        btn_row.pack(fill="x", padx=12, pady=(10, 4))
 
         self.transfer_btn = ctk.CTkButton(
             btn_row, text="📥 Transfer Selected to PC",
-            command=self._start_transfer, height=38,
+            command=self._start_transfer, height=36,
             corner_radius=10, font=ctk.CTkFont(size=13, weight="bold"),
             fg_color="#00aa44", hover_color="#00cc55"
         )
         self.transfer_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
+        self.cancel_btn = ctk.CTkButton(
+            btn_row, text="⏹", width=36, height=36,
+            command=self._cancel_transfer, corner_radius=10,
+            fg_color=ACCENT_RED, hover_color="#ff6688"
+        )
+        self.cancel_btn.pack(side="right")
+
         self.progress_label = ctk.CTkLabel(
             bottom, text="Select files/folders above, then click Transfer",
             font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY
         )
-        self.progress_label.pack(padx=12)
+        self.progress_label.pack(padx=12, anchor="w")
 
         self.progress_bar = ctk.CTkProgressBar(bottom, height=6, corner_radius=3)
         self.progress_bar.pack(fill="x", padx=12, pady=(4, 10))
         self.progress_bar.set(0)
 
-    def _start_server(self):
-        """Start the server."""
+    def _build_connection_panel(self, parent):
+        """Build the connection panel with USB + WiFi options."""
+        ctk.CTkLabel(
+            parent, text="🔌 Connect Phone",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).pack(padx=12, pady=(12, 8), anchor="w")
+
+        # === USB SECTION ===
+        usb_frame = ctk.CTkFrame(parent, fg_color="#0d1a26", corner_radius=10)
+        usb_frame.pack(fill="x", padx=12, pady=(0, 8))
+
+        ctk.CTkLabel(
+            usb_frame, text="⚡ USB (Recommended)",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=ACCENT_GREEN
+        ).pack(padx=10, pady=(8, 2), anchor="w")
+
+        ctk.CTkLabel(
+            usb_frame, text="Fastest • Most reliable • Direct access",
+            font=ctk.CTkFont(size=10), text_color=TEXT_SECONDARY
+        ).pack(padx=10, anchor="w")
+
+        self.usb_btn = ctk.CTkButton(
+            usb_frame, text="🔌 Connect via USB",
+            command=self._connect_usb, height=34,
+            corner_radius=8, font=ctk.CTkFont(size=12, weight="bold")
+        )
+        self.usb_btn.pack(fill="x", padx=10, pady=(8, 10))
+
+        self.usb_status = ctk.CTkLabel(
+            usb_frame, text="",
+            font=ctk.CTkFont(size=10), text_color=TEXT_SECONDARY
+        )
+        self.usb_status.pack(padx=10, pady=(0, 8))
+
+        # ADB availability check
+        if self.adb.adb_available:
+            self.usb_status.configure(text="ADB ✓ ready", text_color=ACCENT_GREEN)
+        else:
+            self.usb_status.configure(
+                text="ADB not found — install Platform Tools",
+                text_color=ACCENT_RED
+            )
+
+        # === WiFi SECTION ===
+        wifi_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        wifi_frame.pack(fill="x", padx=12, pady=(8, 0))
+
+        ctk.CTkLabel(
+            wifi_frame, text="📶 WiFi (Alternative)",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=TEXT_SECONDARY
+        ).pack(anchor="w")
+
+        ctk.CTkLabel(
+            wifi_frame, text="No cable • Phone browser needed",
+            font=ctk.CTkFont(size=10), text_color=TEXT_DIM
+        ).pack(anchor="w")
+
+        self.wifi_btn = ctk.CTkButton(
+            wifi_frame, text="📶 Start WiFi Mode",
+            command=self._start_wifi_mode, height=30,
+            corner_radius=8, font=ctk.CTkFont(size=11),
+            fg_color=TEXT_DIM, hover_color="#3a4050"
+        )
+        self.wifi_btn.pack(fill="x", pady=(6, 0))
+
+        self.qr_label = ctk.CTkLabel(wifi_frame, text="")
+        self.qr_label.pack(pady=5)
+
+        self.wifi_url_label = ctk.CTkLabel(
+            wifi_frame, text="", font=ctk.CTkFont(size=9),
+            text_color=ACCENT_BLUE
+        )
+        self.wifi_url_label.pack()
+
+        # === DEVICE INFO ===
+        self.device_info = ctk.CTkLabel(
+            parent, text="",
+            font=ctk.CTkFont(size=10), text_color=TEXT_SECONDARY,
+            wraplength=240
+        )
+        self.device_info.pack(padx=12, pady=(15, 10), anchor="w")
+
+    def _connect_usb(self):
+        """Connect to phone via USB ADB."""
+        self.usb_btn.configure(state="disabled", text="Connecting...")
+        self.usb_status.configure(text="", text_color=TEXT_SECONDARY)
+
+        def do_connect():
+            success, message = self.adb.connect()
+            self.after(0, lambda: self._on_usb_connected(success, message))
+
+        threading.Thread(target=do_connect, daemon=True).start()
+
+    def _on_usb_connected(self, success: bool, message: str):
+        """Handle USB connection result."""
+        if success:
+            self.usb_btn.configure(text="✓ Connected", fg_color=ACCENT_GREEN)
+            self.usb_status.configure(text=message, text_color=ACCENT_GREEN)
+            self.status_label.configure(text="● USB Connected ✓", text_color=ACCENT_GREEN)
+
+            # Show device info
+            info = self.adb.get_device_info()
+            if info:
+                self.device_info.configure(
+                    text=f"📱 {info['model']} • Android {info['android']}\n"
+                         f"💾 {format_size(info['storage_free'])} free / "
+                         f"{format_size(info['storage_total'])}"
+                )
+
+            # Connect explorer and load root
+            self.explorer.adb = self.adb
+            self.explorer.load_directory("/sdcard")
+        else:
+            self.usb_btn.configure(state="normal", text="🔌 Connect via USB")
+            self.usb_status.configure(text=message, text_color=ACCENT_RED)
+
+    def _start_wifi_mode(self):
+        """Start WiFi mode with QR code."""
         try:
             ip = get_local_ip()
             port = find_free_port()
-            self._server_url = f"http://{ip}:{port}"
+            url = f"http://{ip}:{port}"
+
             os.makedirs(self._destination, exist_ok=True)
 
             self._server = ReceiverServer(
                 port=port,
                 destination=self._destination,
                 mobile_html=MOBILE_PAGE_HTML,
-                progress_callback=self._on_progress,
+                progress_callback=self._on_wifi_progress,
                 phone_ready_callback=self._on_phone_ready
             )
 
-            # Connect explorer to server
-            self.explorer.server = self._server
-
-            self._server_thread = threading.Thread(
+            threading.Thread(
                 target=self._server.serve_forever, daemon=True
-            )
-            self._server_thread.start()
+            ).start()
 
             # Show QR
-            self._show_qr()
-            self.url_label.configure(text=f"Or open: {self._server_url}")
+            qr_image = generate_qr_for_tkinter(url, size=120)
+            if qr_image:
+                self.qr_label.configure(image=qr_image, text="")
+                self.qr_label._image = qr_image
+            else:
+                self.qr_label.configure(text=f"Open:\n{url}", text_color=ACCENT_BLUE)
+
+            self.wifi_url_label.configure(text=url)
+            self.wifi_btn.configure(text="✓ WiFi Server Running", state="disabled")
 
         except Exception as e:
-            self.qr_label.configure(text=f"Error: {e}", text_color=ACCENT_RED)
-
-    def _show_qr(self):
-        """Show QR code."""
-        qr_image = generate_qr_for_tkinter(self._server_url, size=160)
-        if qr_image:
-            self.qr_label.configure(image=qr_image, text="")
-            self.qr_label._image = qr_image
-        else:
-            self.qr_label.configure(
-                text=f"Open on phone:\n{self._server_url}",
-                font=ctk.CTkFont(size=12, weight="bold"),
-                text_color=ACCENT_BLUE
-            )
+            self.wifi_url_label.configure(text=f"Error: {e}", text_color=ACCENT_RED)
 
     def _on_phone_ready(self):
-        """Called when phone grants access."""
-        self._phone_connected = True
-        self.after(0, self._phone_connected_ui)
+        """Phone connected via WiFi."""
+        self.after(0, lambda: self.status_label.configure(
+            text="● WiFi Connected ✓", text_color=ACCENT_GREEN
+        ))
+        # Load via WiFi server
+        if self._server and not self.adb.is_connected:
+            self.after(0, lambda: self.explorer.state_label.configure(
+                text="Phone connected via WiFi.\nUse USB for file browsing or\nsend files from phone browser."
+            ))
 
-    def _phone_connected_ui(self):
-        """Update UI when phone connects."""
-        self.connection_badge.configure(
-            text="● Phone connected ✓", text_color=ACCENT_GREEN
-        )
-        # Load root directory
-        self.explorer.load_directory("")
-
-    def _on_progress(self, stats: ServerStats):
-        """Update progress during transfer."""
+    def _on_wifi_progress(self, stats: ServerStats):
+        """WiFi transfer progress."""
         try:
-            self.after(0, lambda: self._update_progress(stats))
+            self.after(0, lambda: self.progress_label.configure(
+                text=f"📶 WiFi: {stats.total_files_received} files received "
+                     f"({format_size(stats.total_bytes_received)})"
+            ))
         except Exception:
             pass
 
-    def _update_progress(self, stats: ServerStats):
-        if stats.total_files_received > 0:
-            self.progress_label.configure(
-                text=f"✅ {stats.total_files_received} files received "
-                     f"({format_size(stats.total_bytes_received)})"
-            )
-
     def _start_transfer(self):
         """Transfer selected items from phone to PC."""
-        if not self._phone_connected:
-            messagebox.showwarning(
-                "Phone Not Connected",
-                "Scan the QR code with your phone first,\n"
-                "then tap 'Grant Storage Access'."
-            )
+        if not self.adb.is_connected:
+            messagebox.showwarning("Not Connected", "Connect your phone via USB first.")
             return
 
-        selected = self.explorer.get_selected_paths()
-        if not selected:
+        items = self.explorer.get_selected_items()
+        if not items:
             messagebox.showinfo("Nothing Selected", "Select files or folders to transfer.")
             return
 
+        self._transferring = True
         self.transfer_btn.configure(state="disabled", text="Transferring...")
-        self.progress_label.configure(text=f"Transferring {len(selected)} items...")
         self.progress_bar.set(0)
+        self.progress_label.configure(text="Starting transfer...")
 
         def do_transfer():
-            total = len(selected)
-            for i, path in enumerate(selected):
-                # Check if it's a directory — if so, request all files in it
-                entry = next(
-                    (e for e in self.explorer._current_entries if e["name"] == path.split("/")[-1]),
-                    None
-                )
-
-                if entry and entry["type"] == "dir":
-                    # Request transfer of entire folder
-                    self._transfer_folder(path)
-                else:
-                    # Single file
-                    self._server.request_file_transfer(path)
-
-                progress = (i + 1) / total
-                self.after(0, lambda p=progress, idx=i+1: self._update_transfer_progress(p, idx, total))
-
-            self.after(0, self._transfer_complete)
+            self.adb.add_progress_callback(self._on_adb_progress)
+            self.adb.transfer_items(items, self._destination)
+            self.after(0, self._on_transfer_done)
 
         threading.Thread(target=do_transfer, daemon=True).start()
 
-    def _transfer_folder(self, folder_path: str):
-        """Recursively transfer a folder."""
-        result = self._server.list_phone_directory(folder_path)
-        entries = result.get("entries", [])
+    def _on_adb_progress(self, progress: AdbTransferProgress):
+        """Update UI with ADB transfer progress."""
+        try:
+            self.after(0, lambda: self._update_adb_progress(progress))
+        except Exception:
+            pass
 
-        for entry in entries:
-            item_path = f"{folder_path}/{entry['name']}"
-            if entry["type"] == "dir":
-                self._transfer_folder(item_path)
-            else:
-                self._server.request_file_transfer(item_path)
+    def _update_adb_progress(self, p: AdbTransferProgress):
+        """Update progress display."""
+        if p.total_files > 0:
+            pct = p.transferred_files / p.total_files
+            self.progress_bar.set(pct)
+            self.progress_label.configure(
+                text=f"📥 {p.transferred_files}/{p.total_files} files • "
+                     f"{p.current_file}"
+            )
 
-    def _update_transfer_progress(self, progress: float, current: int, total: int):
-        self.progress_bar.set(progress)
-        self.progress_label.configure(text=f"Transferring... {current}/{total} items")
-
-    def _transfer_complete(self):
+    def _on_transfer_done(self):
+        """Transfer complete."""
+        self._transferring = False
+        p = self.adb.progress
         self.transfer_btn.configure(state="normal", text="📥 Transfer Selected to PC")
         self.progress_bar.set(1.0)
-        self.progress_label.configure(
-            text=f"✅ Transfer complete! Files saved to: {os.path.basename(self._destination)}"
+
+        failed = len(p.failed_files)
+        msg = f"✅ Done! {p.transferred_files} files transferred"
+        if failed:
+            msg += f" • {failed} failed"
+        self.progress_label.configure(text=msg)
+
+        messagebox.showinfo(
+            "Transfer Complete",
+            f"✅ {p.transferred_files} files transferred\n"
+            f"❌ {failed} failed\n\n"
+            f"Saved to: {self._destination}"
         )
 
+    def _cancel_transfer(self):
+        """Cancel transfer."""
+        if self._transferring:
+            self.adb.cancel_transfer()
+            self.progress_label.configure(text="⏹ Cancelled")
+            self.transfer_btn.configure(state="normal", text="📥 Transfer Selected to PC")
+
     def _change_destination(self):
+        """Change save folder."""
         path = filedialog.askdirectory(title="Choose save location")
         if path:
             self._destination = path
@@ -556,6 +626,8 @@ class DashboardApp(ctk.CTk):
             self.dest_btn.configure(text=f"📂 {os.path.basename(path)}")
 
     def on_closing(self):
+        if self._transferring:
+            self.adb.cancel_transfer()
         if self._server:
             self._server.shutdown()
         self.destroy()

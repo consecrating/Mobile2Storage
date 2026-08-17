@@ -19,6 +19,7 @@ python -m PyInstaller --name "Mobile2Storage" --onefile --windowed --clean --noc
     --hidden-import=qrcode.image.pil ^
     --hidden-import=src ^
     --hidden-import=src.core ^
+    --hidden-import=src.core.adb_browser ^
     --hidden-import=src.core.receiver_server ^
     --hidden-import=src.core.mobile_page ^
     --hidden-import=src.core.qr_generator ^
