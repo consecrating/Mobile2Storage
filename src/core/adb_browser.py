@@ -148,10 +148,12 @@ class AdbBrowser:
         if not self._connected:
             return []
 
-        # Key fix: pass each arg individually — NOT as one f-string
-        output = self._run("shell", "ls", "-la", path, timeout=60)
+        # Key: trailing slash forces ls to list CONTENTS, not the dir itself
+        # Without it, some devices return the symlink entry for /sdcard
+        target = path if path.endswith("/") else path + "/"
+        output = self._run("shell", "ls", "-la", target, timeout=60)
         if not output:
-            output = self._run("shell", "ls", "-l", path, timeout=60)
+            output = self._run("shell", "ls", "-l", target, timeout=60)
         if not output:
             return []
 
