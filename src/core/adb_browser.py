@@ -51,7 +51,26 @@ class AdbBrowser:
     """
     Browse and transfer files from Android via ADB.
     Works over USB — no phone interaction needed.
+    
+    SAFETY: This tool is READ-ONLY. It NEVER:
+    - Deletes any files from the phone
+    - Modifies any files on the phone
+    - Writes anything to the phone
+    It only uses 'adb pull' (copy FROM phone) and 'adb shell ls/stat' (read info).
     """
+
+    # Safe user folders (shown by default)
+    SAFE_FOLDERS = {
+        "DCIM", "Pictures", "Download", "Downloads", "Documents",
+        "Music", "Movies", "WhatsApp", "Telegram", "Bluetooth",
+        "Recordings", "Podcasts", "Ringtones", "Notifications",
+        "Alarms", "Photos",
+    }
+
+    # Folders to NEVER show (system-critical)
+    HIDDEN_FOLDERS = {
+        "Android", "data", "obb", "LOST.DIR",
+    }
 
     def __init__(self):
         self._adb_path = self._find_adb()
@@ -190,62 +209,96 @@ class AdbBrowser:
     def list_directory(self, path: str = "/sdcard") -> List[PhoneFile]:
         """
         List files and folders in a directory on the phone.
-        Returns immediately — doesn't load file contents.
-        Even 44K+ files folder just returns names+sizes (fast).
+        Uses multiple fallback methods to handle all Android versions.
         """
         if not self._connected:
             return []
 
-        # Use ls -la for detailed listing
-        # -p appends / to directories
-        output = self._run_shell(f'ls -lap "{path}" 2>/dev/null', timeout=60)
+        entries = []
+
+        # METHOD 1: Use 'ls -1' for names + check type with test -d
+        # Most reliable across all Android versions
+        output = self._run_shell(f'ls -1 "{path}" 2>/dev/null', timeout=60)
+
+        if not output:
+            # Try without quotes
+            output = self._run_shell(f'ls -1 {path} 2>/dev/null', timeout=60)
 
         if not output:
             return []
 
-        entries = []
-        for line in output.split("\n"):
-            line = line.strip()
-            if not line or line.startswith("total"):
-                continue
+        names = [n.strip() for n in output.split("\n") if n.strip()]
 
-            # Parse ls -la output
-            # drwxrwx--x 2 root sdcard_rw 4096 2024-01-15 10:30 Camera/
-            # -rw-rw---- 1 root sdcard_rw 1234567 2024-01-15 10:30 photo.jpg
-            parts = line.split(None, 7)
-            if len(parts) < 8:
-                continue
+        # Filter hidden and system
+        names = [n for n in names if not n.startswith(".")]
 
-            perms = parts[0]
-            size_str = parts[4]
-            name = parts[7].strip()
+        # Batch check: which are directories?
+        # Use 'stat' or 'test -d' for each
+        # For efficiency, use a single shell command that outputs "d filename" or "f filename"
+        if names:
+            # Build a script that checks each file
+            # This handles up to ~500 names efficiently
+            batch_size = 200
+            for batch_start in range(0, len(names), batch_size):
+                batch_names = names[batch_start:batch_start + batch_size]
+                
+                # Build check script
+                checks = []
+                for name in batch_names:
+                    safe_name = name.replace('"', '\\"').replace('$', '\\$')
+                    checks.append(
+                        f'if [ -d "{path}/{safe_name}" ]; then '
+                        f'echo "D|{safe_name}|0"; '
+                        f'else '
+                        f's=$(stat -c %s "{path}/{safe_name}" 2>/dev/null || echo 0); '
+                        f'echo "F|{safe_name}|$s"; '
+                        f'fi'
+                    )
 
-            # Skip . and ..
-            if name in (".", "..", "./", "../"):
-                continue
+                script = "; ".join(checks)
+                result = self._run_shell(script, timeout=60)
 
-            is_dir = perms.startswith("d") or name.endswith("/")
-            name = name.rstrip("/")
+                if result:
+                    for line in result.split("\n"):
+                        line = line.strip()
+                        if not line or "|" not in line:
+                            continue
+                        parts = line.split("|", 2)
+                        if len(parts) < 3:
+                            continue
+                        file_type = parts[0]
+                        name = parts[1]
+                        try:
+                            size = int(parts[2])
+                        except ValueError:
+                            size = 0
 
-            # Skip hidden files
-            if name.startswith("."):
-                continue
+                        entries.append(PhoneFile(
+                            name=name,
+                            path=f"{path}/{name}",
+                            is_dir=(file_type == "D"),
+                            size=size if file_type == "F" else 0
+                        ))
+                else:
+                    # Fallback: just add names without size info
+                    for name in batch_names:
+                        entries.append(PhoneFile(
+                            name=name,
+                            path=f"{path}/{name}",
+                            is_dir=False,  # Can't determine
+                            size=0
+                        ))
 
-            try:
-                size = int(size_str)
-            except ValueError:
-                size = 0
-
-            full_path = f"{path}/{name}"
-            entries.append(PhoneFile(
-                name=name,
-                path=full_path,
-                is_dir=is_dir,
-                size=size if not is_dir else 0
-            ))
-
-        # Sort: folders first, then files alphabetically
+        # Sort: folders first, then files
         entries.sort(key=lambda e: (not e.is_dir, e.name.lower()))
+
+        # SAFETY: At /sdcard root level, hide system folders
+        if path == "/sdcard" or path == "/storage/emulated/0":
+            entries = [
+                e for e in entries
+                if e.name not in self.HIDDEN_FOLDERS
+            ]
+
         return entries
 
     def get_folder_size(self, path: str) -> Tuple[int, int]:

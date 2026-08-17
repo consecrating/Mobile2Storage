@@ -62,69 +62,83 @@ class FileExplorer(ctk.CTkFrame):
     def _build_ui(self):
         # Header
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=12, pady=(10, 4))
+        header.pack(fill="x", padx=14, pady=(12, 4))
 
         ctk.CTkLabel(
             header, text="📱 Phone Storage",
-            font=ctk.CTkFont(size=14, weight="bold")
+            font=ctk.CTkFont(size=15, weight="bold")
         ).pack(side="left")
 
         self.path_label = ctk.CTkLabel(
             header, text="/sdcard",
-            font=ctk.CTkFont(family="Consolas", size=10),
-            text_color=TEXT_SECONDARY
+            font=ctk.CTkFont(family="Consolas", size=11),
+            text_color=ACCENT_BLUE
         )
         self.path_label.pack(side="right")
 
+        # Safety badge
+        safety = ctk.CTkLabel(
+            self, text="🛡️ Read-only • Files are only COPIED, never deleted or modified",
+            font=ctk.CTkFont(size=10), text_color=TEXT_DIM
+        )
+        safety.pack(padx=14, anchor="w")
+
         # Navigation
-        nav = ctk.CTkFrame(self, fg_color="transparent")
-        nav.pack(fill="x", padx=12, pady=4)
+        nav = ctk.CTkFrame(self, fg_color="#1c2128", corner_radius=8, height=38)
+        nav.pack(fill="x", padx=12, pady=6)
+        nav.pack_propagate(False)
 
         self.back_btn = ctk.CTkButton(
-            nav, text="⬅ Back", width=65, height=26,
+            nav, text="← Back", width=70, height=28,
             command=self._go_back, corner_radius=6,
-            font=ctk.CTkFont(size=11)
+            font=ctk.CTkFont(size=11), fg_color="#2d333b", hover_color="#3a4150"
         )
-        self.back_btn.pack(side="left", padx=(0, 4))
+        self.back_btn.pack(side="left", padx=4, pady=4)
 
         self.home_btn = ctk.CTkButton(
-            nav, text="🏠", width=30, height=26,
-            command=self._go_home, corner_radius=6
+            nav, text="🏠 Home", width=70, height=28,
+            command=self._go_home, corner_radius=6,
+            font=ctk.CTkFont(size=11), fg_color="#2d333b", hover_color="#3a4150"
         )
-        self.home_btn.pack(side="left", padx=(0, 4))
+        self.home_btn.pack(side="left", padx=2, pady=4)
 
         self.refresh_btn = ctk.CTkButton(
-            nav, text="🔄", width=30, height=26,
+            nav, text="↻ Refresh", width=75, height=28,
             command=lambda: self.load_directory(self.current_path),
-            corner_radius=6
+            corner_radius=6, font=ctk.CTkFont(size=11),
+            fg_color="#2d333b", hover_color="#3a4150"
         )
-        self.refresh_btn.pack(side="left", padx=(0, 8))
+        self.refresh_btn.pack(side="left", padx=2, pady=4)
 
         self.select_all_btn = ctk.CTkButton(
-            nav, text="☑ All", width=50, height=26,
+            nav, text="☑ Select All", width=85, height=28,
             command=self._select_all, corner_radius=6,
-            font=ctk.CTkFont(size=11)
+            font=ctk.CTkFont(size=11), fg_color="#2d333b", hover_color="#3a4150"
         )
-        self.select_all_btn.pack(side="left")
+        self.select_all_btn.pack(side="left", padx=2, pady=4)
 
         self.sel_label = ctk.CTkLabel(
-            nav, text="", font=ctk.CTkFont(size=11),
+            nav, text="", font=ctk.CTkFont(size=11, weight="bold"),
             text_color=ACCENT_GREEN
         )
-        self.sel_label.pack(side="right")
+        self.sel_label.pack(side="right", padx=8)
 
         # File list
         self.file_list = ctk.CTkScrollableFrame(
-            self, fg_color="transparent",
+            self, fg_color="#0d1117", corner_radius=8,
             scrollbar_button_color=TEXT_DIM
         )
-        self.file_list.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.file_list.pack(fill="both", expand=True, padx=12, pady=(0, 10))
 
         self.state_label = ctk.CTkLabel(
-            self.file_list, text="Connect your phone to browse files",
-            font=ctk.CTkFont(size=12), text_color=TEXT_DIM
+            self.file_list,
+            text="🔌 Connect your phone via USB to browse files\n\n"
+                 "Your files will appear here.\n"
+                 "Only user files are shown (system files are hidden).",
+            font=ctk.CTkFont(size=13), text_color=TEXT_DIM,
+            justify="center"
         )
-        self.state_label.pack(pady=40)
+        self.state_label.pack(pady=50)
 
     def load_directory(self, path: str):
         """Load and display a directory."""
@@ -162,12 +176,12 @@ class FileExplorer(ctk.CTkFrame):
             self._add_item(i, entry)
 
     def _add_item(self, index: int, entry: PhoneFile):
-        """Add one file/folder entry."""
+        """Add one file/folder entry — modern style."""
         frame = ctk.CTkFrame(
-            self.file_list, height=34, corner_radius=5,
-            fg_color="#1c2128"
+            self.file_list, height=38, corner_radius=8,
+            fg_color="#161b22", border_width=1, border_color="#21262d"
         )
-        frame.pack(fill="x", pady=1)
+        frame.pack(fill="x", pady=2, padx=2)
         frame.pack_propagate(False)
 
         # Checkbox
