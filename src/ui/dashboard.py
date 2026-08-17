@@ -13,7 +13,9 @@ from tkinter import filedialog, messagebox
 import threading
 import time
 import os
+import tempfile
 from typing import Optional, List
+from PIL import Image, ImageTk
 
 from ..core.adb_browser import AdbBrowser, PhoneFile, AdbTransferProgress
 from ..core.receiver_server import (
@@ -38,22 +40,138 @@ TEXT_DIM = "#484f58"
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
+# Thumbnail cache directory
+THUMB_CACHE = os.path.join(tempfile.gettempdir(), "m2s_thumbcache")
+os.makedirs(THUMB_CACHE, exist_ok=True)
+
+# Image/video extensions for preview
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic"}
+VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".3gp", ".webm", ".flv"}
+
+
+class PreviewWindow(ctk.CTkToplevel):
+    """Fullscreen image/video preview with next/back navigation."""
+
+    def __init__(self, parent, adb, files: List, start_index: int = 0):
+        super().__init__(parent)
+        self.title("Preview")
+        self.geometry("900x650")
+        self.configure(fg_color="#000000")
+        self.adb = adb
+        self.files = files  # List of PhoneFile (media only)
+        self.index = start_index
+        self._photo = None
+
+        # Controls
+        nav = ctk.CTkFrame(self, fg_color="#111111", height=50)
+        nav.pack(fill="x", side="bottom")
+        nav.pack_propagate(False)
+
+        self.prev_btn = ctk.CTkButton(
+            nav, text="← Previous", width=100, height=34,
+            command=self._prev, corner_radius=8
+        )
+        self.prev_btn.pack(side="left", padx=10, pady=8)
+
+        self.info_label = ctk.CTkLabel(
+            nav, text="", font=ctk.CTkFont(size=12)
+        )
+        self.info_label.pack(side="left", fill="x", expand=True)
+
+        self.next_btn = ctk.CTkButton(
+            nav, text="Next →", width=100, height=34,
+            command=self._next, corner_radius=8
+        )
+        self.next_btn.pack(side="right", padx=10, pady=8)
+
+        # Image display
+        self.image_label = ctk.CTkLabel(self, text="Loading...", fg_color="#000000")
+        self.image_label.pack(fill="both", expand=True)
+
+        # Keyboard bindings
+        self.bind("<Left>", lambda e: self._prev())
+        self.bind("<Right>", lambda e: self._next())
+        self.bind("<Escape>", lambda e: self.destroy())
+
+        self._show_current()
+
+    def _show_current(self):
+        """Display the current file."""
+        if not self.files or self.index >= len(self.files):
+            return
+
+        f = self.files[self.index]
+        self.info_label.configure(
+            text=f"{f.name}  ({self.index + 1}/{len(self.files)})"
+        )
+
+        ext = os.path.splitext(f.name)[1].lower()
+        if ext in IMAGE_EXTS:
+            self._load_image(f)
+        elif ext in VIDEO_EXTS:
+            self.image_label.configure(
+                text=f"🎬 {f.name}\n\nVideo preview not available\nTransfer to PC to play",
+                font=ctk.CTkFont(size=16)
+            )
+        else:
+            self.image_label.configure(text=f.name)
+
+    def _load_image(self, f: 'PhoneFile'):
+        """Pull and display image."""
+        self.image_label.configure(text="Loading...", image=None)
+
+        def do_load():
+            local = self.adb.pull_thumbnail(f.path, THUMB_CACHE)
+            if local:
+                self.after(0, lambda: self._display_image(local))
+            else:
+                self.after(0, lambda: self.image_label.configure(text="Failed to load"))
+
+        threading.Thread(target=do_load, daemon=True).start()
+
+    def _display_image(self, local_path: str):
+        """Show image scaled to fit window."""
+        try:
+            img = Image.open(local_path)
+            # Scale to fit
+            w, h = self.winfo_width() - 20, self.winfo_height() - 80
+            if w < 100: w = 800
+            if h < 100: h = 550
+            img.thumbnail((w, h), Image.LANCZOS)
+
+            photo = ctk.CTkImage(light_image=img, dark_image=img,
+                                 size=(img.width, img.height))
+            self._photo = photo  # Keep reference
+            self.image_label.configure(image=photo, text="")
+        except Exception as e:
+            self.image_label.configure(text=f"Cannot display: {e}")
+
+    def _next(self):
+        if self.index < len(self.files) - 1:
+            self.index += 1
+            self._show_current()
+
+    def _prev(self):
+        if self.index > 0:
+            self.index -= 1
+            self._show_current()
 
 class FileExplorer(ctk.CTkFrame):
     """
     File explorer showing phone files.
-    Works with ADB browser for direct file listing.
+    Click folders to navigate, click images/videos to preview.
     """
 
-    def __init__(self, parent, **kwargs):
+    def __init__(self, parent, app=None, **kwargs):
         kwargs.setdefault("corner_radius", 12)
         kwargs.setdefault("fg_color", CARD_BG)
         super().__init__(parent, **kwargs)
 
+        self.app = app  # DashboardApp reference for preview window
         self.adb: Optional[AdbBrowser] = None
         self.current_path = "/sdcard"
         self._entries: List[PhoneFile] = []
-        self._selected: set = set()  # indices of selected entries
+        self._selected: set = set()
         self._item_widgets = []
         self._checkboxes = []
 
@@ -215,15 +333,21 @@ class FileExplorer(ctk.CTkFrame):
 
         ctk.CTkLabel(frame, text=icon, width=22).pack(side="left", padx=2)
 
+        # Detect if this is a previewable media file
+        ext_lower = ("." + entry.name.rsplit(".", 1)[-1].lower()) if "." in entry.name else ""
+        is_media = ext_lower in IMAGE_EXTS or ext_lower in VIDEO_EXTS
+
         name_label = ctk.CTkLabel(
             frame, text=entry.name, font=font,
             text_color=color, anchor="w",
-            cursor="hand2" if entry.is_dir else ""
+            cursor="hand2" if (entry.is_dir or is_media) else ""
         )
         name_label.pack(side="left", fill="x", expand=True, padx=4)
 
         if entry.is_dir:
             name_label.bind("<Button-1>", lambda e, p=entry.path: self.load_directory(p))
+        elif is_media:
+            name_label.bind("<Button-1>", lambda e, idx=index: self._open_preview(idx))
 
         # Size
         if not entry.is_dir and entry.size > 0:
@@ -289,6 +413,25 @@ class FileExplorer(ctk.CTkFrame):
         """Get selected PhoneFile items."""
         return [self._entries[i] for i in self._selected if i < len(self._entries)]
 
+    def _open_preview(self, index: int):
+        """Open media file in fullscreen preview window."""
+        if not self.adb:
+            return
+        # Collect all media files in current listing for next/back navigation
+        media_files = []
+        media_index = 0
+        for i, entry in enumerate(self._entries):
+            if entry.is_dir:
+                continue
+            ext = ("." + entry.name.rsplit(".", 1)[-1].lower()) if "." in entry.name else ""
+            if ext in IMAGE_EXTS or ext in VIDEO_EXTS:
+                if i == index:
+                    media_index = len(media_files)
+                media_files.append(entry)
+
+        if media_files:
+            PreviewWindow(self.winfo_toplevel(), self.adb, media_files, media_index)
+
 
 class DashboardApp(ctk.CTk):
     """
@@ -353,7 +496,7 @@ class DashboardApp(ctk.CTk):
         right.pack(side="right", fill="both", expand=True)
 
         # File Explorer
-        self.explorer = FileExplorer(right)
+        self.explorer = FileExplorer(right, app=self)
         self.explorer.pack(fill="both", expand=True, pady=(0, 8))
 
         # Transfer controls

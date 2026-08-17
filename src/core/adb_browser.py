@@ -149,12 +149,33 @@ class AdbBrowser:
             return []
 
         # Key: trailing slash forces ls to list CONTENTS, not the dir itself
-        # Without it, some devices return the symlink entry for /sdcard
         target = path if path.endswith("/") else path + "/"
-        output = self._run("shell", "ls", "-la", target, timeout=60)
+
+        # Try ls -la first (gives sizes). Use long timeout for big folders.
+        output = self._run("shell", "ls", "-la", target, timeout=300)
+
         if not output:
-            output = self._run("shell", "ls", "-l", target, timeout=60)
+            # Fallback: ls without -a (faster, skips hidden anyway)
+            output = self._run("shell", "ls", "-l", target, timeout=300)
+
         if not output:
+            # Last fallback: plain ls (just names, no sizes, but FAST)
+            output = self._run("shell", "ls", target, timeout=120)
+            if output:
+                # Plain ls: every line is a name, no type/size info
+                entries = []
+                for line in output.split("\n"):
+                    name = line.rstrip("\r").strip()
+                    if not name or name.startswith("."):
+                        continue
+                    entries.append(PhoneFile(
+                        name=name, path=f"{path}/{name}",
+                        is_dir=False, size=0  # Can't tell type from plain ls
+                    ))
+                entries.sort(key=lambda e: e.name.lower())
+                if path in ("/sdcard", "/storage/emulated/0"):
+                    entries = [e for e in entries if e.name not in self.HIDDEN_FOLDERS]
+                return entries
             return []
 
         entries = []
@@ -310,6 +331,24 @@ class AdbBrowser:
 
     def cancel_transfer(self):
         self._cancel = True
+
+    def pull_thumbnail(self, remote_path: str, local_cache_dir: str) -> Optional[str]:
+        """
+        Pull a file from phone to a local cache for preview.
+        Returns local path if successful, None otherwise.
+        """
+        os.makedirs(local_cache_dir, exist_ok=True)
+        filename = os.path.basename(remote_path)
+        local_path = os.path.join(local_cache_dir, filename)
+
+        # Skip if already cached
+        if os.path.exists(local_path):
+            return local_path
+
+        result = self._run("pull", remote_path, local_path, timeout=30)
+        if result is not None and os.path.exists(local_path):
+            return local_path
+        return None
 
     def get_device_info(self) -> dict:
         if not self._connected:
