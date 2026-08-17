@@ -230,7 +230,8 @@ class StatCard(ctk.CTkFrame):
     
     def __init__(self, parent, icon: str, label: str, value: str = "--",
                  accent_color: str = "#00d4ff", **kwargs):
-        super().__init__(parent, corner_radius=12, **kwargs)
+        kwargs.setdefault("corner_radius", 12)
+        super().__init__(parent, **kwargs)
         
         self.accent_color = accent_color
         self._build_ui(icon, label, value)

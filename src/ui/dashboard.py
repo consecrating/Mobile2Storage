@@ -47,7 +47,9 @@ class DevicePanel(ctk.CTkFrame):
     """Compact device connection panel."""
     
     def __init__(self, parent, connection: ConnectionManager, **kwargs):
-        super().__init__(parent, corner_radius=12, fg_color=CARD_BG, **kwargs)
+        kwargs.setdefault("corner_radius", 12)
+        kwargs.setdefault("fg_color", CARD_BG)
+        super().__init__(parent, **kwargs)
         self.connection = connection
         self._build_ui()
     
@@ -158,7 +160,9 @@ class MainProgressDisplay(ctk.CTkFrame):
     """
     
     def __init__(self, parent, **kwargs):
-        super().__init__(parent, corner_radius=16, fg_color=CARD_BG, **kwargs)
+        kwargs.setdefault("corner_radius", 16)
+        kwargs.setdefault("fg_color", CARD_BG)
+        super().__init__(parent, **kwargs)
         self._build_ui()
     
     def _build_ui(self):
@@ -382,7 +386,9 @@ class FileQueuePanel(ctk.CTkFrame):
     """File queue with mini progress bars and status."""
     
     def __init__(self, parent, **kwargs):
-        super().__init__(parent, corner_radius=12, fg_color=CARD_BG, **kwargs)
+        kwargs.setdefault("corner_radius", 12)
+        kwargs.setdefault("fg_color", CARD_BG)
+        super().__init__(parent, **kwargs)
         self._build_ui()
         self._items = []
     
@@ -508,7 +514,9 @@ class DiscoveryPanel(ctk.CTkFrame):
     """Compact file discovery status panel."""
     
     def __init__(self, parent, **kwargs):
-        super().__init__(parent, corner_radius=12, fg_color=CARD_BG, **kwargs)
+        kwargs.setdefault("corner_radius", 12)
+        kwargs.setdefault("fg_color", CARD_BG)
+        super().__init__(parent, **kwargs)
         self._build_ui()
     
     def _build_ui(self):
