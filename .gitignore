@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.egg-info/
+.mobile2storage_wal.json
+.mobile2storage_resume.json
+*.m2s_tmp
+*.part
