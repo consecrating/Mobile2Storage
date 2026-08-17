@@ -227,115 +227,63 @@ class AdbBrowser:
     def list_directory(self, path: str = "/sdcard") -> List[PhoneFile]:
         """
         List files and folders in a directory on the phone.
-        Uses simple, reliable approach that works on ALL Android versions.
+
+        Strategy (works on ALL Android shells — toybox/toolbox/busybox):
+        1. Get names + type via 'ls -p' (dirs end with '/') -> reliable
+        2. Get sizes via 'ls -la' parsed with regex -> best effort
+        Files ALWAYS show even if size parsing fails.
         """
         if not self._connected:
             return []
 
-        entries = []
-
-        # Use 'ls -la' — the most widely supported listing command
-        # Parse permissively: first char 'd' = dir, otherwise file
-        # Get size from whichever numeric column makes sense
-        output = self._run_shell(f'ls -la "{path}"', timeout=60)
-
-        if not output:
-            output = self._run_shell(f'ls -la {path}', timeout=60)
-        if not output:
-            # Last resort: just names
-            output = self._run_shell(f'ls "{path}"', timeout=60)
-            if output:
-                for name in output.split("\n"):
-                    name = name.strip()
-                    if name and not name.startswith("."):
-                        entries.append(PhoneFile(
-                            name=name, path=f"{path}/{name}",
-                            is_dir=False, size=0
-                        ))
-                entries.sort(key=lambda e: e.name.lower())
-                return entries
+        # STEP 1: names with dir markers ('ls -p' appends '/' to dirs)
+        raw = self._run_shell(f'ls -p "{path}"', timeout=60)
+        if not raw:
+            raw = self._run_shell(f'ls -p {path}', timeout=60)
+        if not raw:
+            raw = self._run_shell(f'ls "{path}"', timeout=60)
+        if not raw:
             return []
 
-        for line in output.split("\n"):
-            line = line.strip()
-            if not line or line.startswith("total"):
+        name_is_dir = {}
+        for line in raw.split("\n"):
+            name = line.rstrip("\r").strip()
+            if not name or name in (".", "..", "./", "../"):
                 continue
+            is_dir = name.endswith("/")
+            clean = name[:-1] if is_dir else name
+            if clean.startswith("."):
+                continue  # skip hidden
+            name_is_dir[clean] = is_dir
 
-            # First character determines type
-            is_dir = line.startswith("d")
+        # STEP 2: sizes via 'ls -la' (best-effort, never breaks listing)
+        size_map = {}
+        la = self._run_shell(f'ls -la "{path}"', timeout=60)
+        if la:
+            for line in la.split("\n"):
+                line = line.rstrip("\r")
+                if not line or line.startswith("total"):
+                    continue
+                sm = re.search(r'\s(\d+)\s+(?:\d{4}-\d{2}-\d{2}|[A-Za-z]{3}\s+\d{1,2})\s', line)
+                nm = re.search(r'\d{1,2}:\d{2}\s+(.+)$', line)
+                if not nm:
+                    nm = re.search(r'\d{4}-\d{2}-\d{2}\s+(.+)$', line)
+                if nm:
+                    fname = nm.group(1).strip().rstrip("/")
+                    if sm:
+                        try:
+                            size_map[fname] = int(sm.group(1))
+                        except ValueError:
+                            pass
 
-            # Split into parts — name is ALWAYS the last portion
-            # The challenge: name might have spaces
-            # Strategy: split by whitespace, find the last numeric field (size),
-            # everything after date/time is the filename
-            parts = line.split()
-            if len(parts) < 6:
-                continue
-
-            # Find the filename: it's after the date+time fields
-            # On Android ls -la, format is typically:
-            # perms links owner group size date time name
-            # OR: perms links owner group size date name
-            # We find the size (largest number before the name) and take everything after date/time
-            
-            # Simple approach: try to find name by looking for the date pattern
-            # Date patterns: "2024-01-15" or "Jan 15" or "2024-01-15 10:30"
-            name = None
-            size = 0
-            
-            # Try splitting with max 7 fields (standard ls -la)
-            try:
-                # Look for size as the number before date
-                # Walk backwards from end to find the name
-                # Name = everything after the last time/date field
-                
-                # Method: find position of first date-like field, name is after time
-                for i in range(4, min(8, len(parts))):
-                    # Check if this looks like a size (number)
-                    try:
-                        possible_size = int(parts[i])
-                        # Next fields should be date — and rest is name
-                        # Take everything from i+2 or i+3 onwards as name
-                        if i + 2 < len(parts):
-                            # Check if parts[i+1] looks like a date
-                            remaining_start = i + 2
-                            # If there's also a time field, skip it
-                            if i + 3 <= len(parts) and ":" in parts[i + 2]:
-                                remaining_start = i + 3
-                            elif i + 2 < len(parts) and len(parts[i+1]) >= 8:
-                                remaining_start = i + 2
-                            
-                            if remaining_start < len(parts):
-                                name = " ".join(parts[remaining_start:])
-                                size = possible_size
-                                break
-                    except ValueError:
-                        continue
-            except (IndexError, ValueError):
-                pass
-
-            # Fallback: just take the last part as name
-            if not name:
-                name = parts[-1]
-
-            # Clean up name
-            name = name.strip()
-            if name.endswith("/"):
-                name = name[:-1]
-                is_dir = True
-
-            # Skip . and ..
-            if name in (".", ".."):
-                continue
-            # Skip hidden
-            if name.startswith("."):
-                continue
-
+        # STEP 3: combine
+        entries = []
+        for name, is_dir in name_is_dir.items():
             entries.append(PhoneFile(
                 name=name,
                 path=f"{path}/{name}",
                 is_dir=is_dir,
-                size=size if not is_dir else 0
+                size=0 if is_dir else size_map.get(name, 0)
             ))
 
         # Sort: folders first, then files
@@ -419,28 +367,53 @@ class AdbBrowser:
 
         process = subprocess.Popen(cmd, **kwargs)
 
-        # Parse adb pull output for progress
-        # Output lines like: "/sdcard/DCIM/photo.jpg": 1 file pulled, 0 skipped. 45.2 MB/s
+        # Parse adb pull output for progress.
+        # adb prints lines as it copies each file. We count them.
+        # Formats vary by adb version:
+        #   "/sdcard/DCIM/a.jpg" -> local  (older)
+        #   [ 12%] /sdcard/DCIM/a.jpg      (newer, live percent)
+        #   X files pulled, Y skipped.     (final summary)
+        base_count = self.progress.transferred_files
         files_pulled = 0
-        while True:
-            line = process.stdout.readline()
-            if not line and process.poll() is not None:
-                break
-            if line:
-                line = line.strip()
-                # Count pulled files
-                if "pulled" in line or "file pulled" in line:
-                    files_pulled += 1
-                    self.progress.transferred_files = files_pulled
-                    self.progress.current_file = line.split(":")[0].strip('" ') if ":" in line else ""
-                    self._notify_progress()
-
-                    if progress_callback:
-                        progress_callback(files_pulled, line)
-
+        try:
+            while True:
                 if self._cancel:
                     process.terminate()
                     return
+
+                line = process.stdout.readline()
+                if not line:
+                    if process.poll() is not None:
+                        break
+                    continue
+
+                line = line.strip()
+                if not line:
+                    continue
+
+                # A file path line = one file being copied
+                if line.startswith("[") or "/" in line.split(":")[0]:
+                    # Extract filename for display
+                    fname = line
+                    if "]" in line:
+                        fname = line.split("]", 1)[1].strip()
+                    fname = fname.split("/")[-1].strip('" ')
+                    if fname and not fname.endswith("%"):
+                        files_pulled += 1
+                        self.progress.transferred_files = base_count + files_pulled
+                        self.progress.current_file = fname
+                        self._notify_progress()
+
+                # Final summary line
+                if "files pulled" in line or "file pulled" in line:
+                    m = re.search(r'(\d+)\s+files?\s+pulled', line)
+                    if m:
+                        pulled = int(m.group(1))
+                        if pulled > files_pulled:
+                            self.progress.transferred_files = base_count + pulled
+                            self._notify_progress()
+        except Exception:
+            pass
 
         process.wait()
 
@@ -448,33 +421,26 @@ class AdbBrowser:
         """
         Transfer multiple selected items (files and/or folders) to PC.
         Runs in background. Updates self.progress.
+
+        NOTE: We do NOT pre-scan folder sizes (that used 'du'/'find' which
+        hang on huge folders). We start transferring IMMEDIATELY and count
+        files as they arrive. Progress is shown by file count, not %.
         """
         self._cancel = False
         self.progress = AdbTransferProgress(is_active=True)
 
-        # Calculate totals for selected items
-        total_size = 0
-        total_files = 0
-        for item in items:
-            if item.is_dir:
-                size, count = self.get_folder_size(item.path)
-                total_size += size
-                total_files += count
-            else:
-                total_size += item.size
-                total_files += 1
-
-        self.progress.total_bytes = total_size
-        self.progress.total_files = total_files
+        # Rough total = number of selected items (folders count as 1 for now)
+        # Actual file count grows as folders are pulled
+        self.progress.total_files = len(items)
         self._notify_progress()
 
-        # Transfer each item
+        # Transfer each item — no pre-scan, start immediately
         for item in items:
             if self._cancel:
                 break
 
             if item.is_dir:
-                self.progress.current_file = f"📁 {item.name}/"
+                self.progress.current_file = f"📁 {item.name}/ (transferring...)"
                 self._notify_progress()
                 self.pull_folder(item.path, destination)
             else:

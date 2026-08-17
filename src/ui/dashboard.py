@@ -594,13 +594,19 @@ class DashboardApp(ctk.CTk):
             pass
 
     def _update_adb_progress(self, p: AdbTransferProgress):
-        """Update progress display."""
-        if p.total_files > 0:
-            pct = p.transferred_files / p.total_files
-            self.progress_bar.set(pct)
+        """Update progress display (count-based, since we don't pre-scan)."""
+        # Animated indeterminate-style bar based on activity
+        if p.is_active:
+            # Pulse the bar so user sees it's working
+            current = self.progress_bar.get()
+            self.progress_bar.set((current + 0.02) % 1.0)
             self.progress_label.configure(
-                text=f"📥 {p.transferred_files}/{p.total_files} files • "
-                     f"{p.current_file}"
+                text=f"📥 {p.transferred_files} files copied • {p.current_file}"
+            )
+        else:
+            self.progress_bar.set(1.0)
+            self.progress_label.configure(
+                text=f"📥 {p.transferred_files} files copied"
             )
 
     def _on_transfer_done(self):
