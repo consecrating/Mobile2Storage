@@ -1,4 +1,4 @@
 customtkinter>=5.2.0
 Pillow>=10.0.0
+qrcode>=7.4.0
 pyinstaller>=6.0.0
-pyadb3>=0.1.0
