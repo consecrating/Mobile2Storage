@@ -1,13 +1,14 @@
 """
-Mobile2Storage - Simplified Dashboard.
-ZERO SETUP. Maximum speed.
+Mobile2Storage - PC Dashboard with Remote File Explorer.
 
-How it works:
-1. Open app → QR code appears
-2. Scan with phone → File picker opens
-3. Pick files, tap Send → Files fly to PC at max WiFi speed
+Architecture:
+- Phone grants storage access (one tap)
+- PC shows a FILE EXPLORER of the phone's files
+- User browses and selects folders/files FROM THE PC
+- PC requests transfers — phone sends them over WiFi
 
-That's it. No ADB, no developer options, no IP addresses.
+The phone never processes or displays large file lists.
+All heavy lifting done on the PC side.
 """
 
 import customtkinter as ctk
@@ -42,36 +43,277 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 
+class PhoneFileExplorer(ctk.CTkFrame):
+    """
+    File explorer that browses the phone's files remotely.
+    Folders load on-demand (only when you click into them).
+    """
+
+    def __init__(self, parent, server: ReceiverServer, **kwargs):
+        kwargs.setdefault("corner_radius", 12)
+        kwargs.setdefault("fg_color", CARD_BG)
+        super().__init__(parent, **kwargs)
+        
+        self.server = server
+        self.current_path = ""
+        self._selected_items = set()
+        self._current_entries = []
+        self._item_widgets = []
+        
+        self._build_ui()
+
+    def _build_ui(self):
+        # Header with path breadcrumb
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=12, pady=(10, 5))
+
+        ctk.CTkLabel(
+            header, text="📱 Phone Files",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).pack(side="left")
+
+        self.path_label = ctk.CTkLabel(
+            header, text="/",
+            font=ctk.CTkFont(size=11),
+            text_color=TEXT_SECONDARY
+        )
+        self.path_label.pack(side="right")
+
+        # Navigation buttons
+        nav = ctk.CTkFrame(self, fg_color="transparent")
+        nav.pack(fill="x", padx=12, pady=4)
+
+        self.back_btn = ctk.CTkButton(
+            nav, text="⬅ Back", width=70, height=28,
+            command=self._go_back, corner_radius=8,
+            font=ctk.CTkFont(size=11)
+        )
+        self.back_btn.pack(side="left", padx=(0, 5))
+
+        self.refresh_btn = ctk.CTkButton(
+            nav, text="🔄 Refresh", width=80, height=28,
+            command=self._refresh, corner_radius=8,
+            font=ctk.CTkFont(size=11)
+        )
+        self.refresh_btn.pack(side="left", padx=(0, 5))
+
+        self.select_all_btn = ctk.CTkButton(
+            nav, text="☑ Select All", width=90, height=28,
+            command=self._select_all, corner_radius=8,
+            font=ctk.CTkFont(size=11)
+        )
+        self.select_all_btn.pack(side="left")
+
+        self.selection_label = ctk.CTkLabel(
+            nav, text="", font=ctk.CTkFont(size=11),
+            text_color=ACCENT_GREEN
+        )
+        self.selection_label.pack(side="right")
+
+        # File list (scrollable)
+        self.file_list = ctk.CTkScrollableFrame(
+            self, fg_color="transparent",
+            scrollbar_button_color=TEXT_DIM
+        )
+        self.file_list.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        # Loading / empty state
+        self.state_label = ctk.CTkLabel(
+            self.file_list, text="Waiting for phone to connect...",
+            font=ctk.CTkFont(size=13), text_color=TEXT_DIM
+        )
+        self.state_label.pack(pady=30)
+
+    def load_directory(self, path: str = ""):
+        """Load a directory listing from the phone."""
+        self.current_path = path
+        self.path_label.configure(text="/" + path if path else "/")
+        self._selected_items.clear()
+        self._update_selection_label()
+
+        # Show loading state
+        self._clear_items()
+        self.state_label.configure(text="Loading...")
+        self.state_label.pack(pady=30)
+
+        # Load in background thread
+        def do_load():
+            result = self.server.list_phone_directory(path)
+            self.after(0, lambda: self._display_entries(result))
+
+        threading.Thread(target=do_load, daemon=True).start()
+
+    def _display_entries(self, result: dict):
+        """Display directory entries."""
+        self._clear_items()
+        self.state_label.pack_forget()
+
+        entries = result.get("entries", [])
+        error = result.get("error", "")
+
+        if error:
+            self.state_label.configure(text=f"Error: {error}")
+            self.state_label.pack(pady=30)
+            return
+
+        if not entries:
+            self.state_label.configure(text="Empty folder")
+            self.state_label.pack(pady=30)
+            return
+
+        self._current_entries = entries
+
+        for entry in entries:
+            self._add_entry_widget(entry)
+
+    def _add_entry_widget(self, entry: dict):
+        """Add a single file/folder entry to the list."""
+        name = entry["name"]
+        is_dir = entry["type"] == "dir"
+        size = entry.get("size", 0)
+
+        frame = ctk.CTkFrame(
+            self.file_list, height=36, corner_radius=6,
+            fg_color="#1c2128"
+        )
+        frame.pack(fill="x", pady=1)
+        frame.pack_propagate(False)
+
+        # Checkbox for selection
+        var = ctk.BooleanVar(value=False)
+        cb = ctk.CTkCheckBox(
+            frame, text="", variable=var,
+            width=24, height=24,
+            checkbox_width=18, checkbox_height=18,
+            corner_radius=4,
+            command=lambda n=name, v=var: self._toggle_select(n, v)
+        )
+        cb.pack(side="left", padx=(8, 4))
+
+        # Icon
+        if is_dir:
+            icon = "📁"
+        else:
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            icon_map = {
+                "jpg": "🖼️", "jpeg": "🖼️", "png": "🖼️", "heic": "🖼️",
+                "mp4": "🎬", "avi": "🎬", "mkv": "🎬", "mov": "🎬",
+                "mp3": "🎵", "wav": "🎵", "flac": "🎵", "m4a": "🎵",
+                "pdf": "📄", "doc": "📄", "docx": "📄", "txt": "📄",
+                "zip": "📦", "rar": "📦", "apk": "📱",
+            }
+            icon = icon_map.get(ext, "📎")
+
+        icon_label = ctk.CTkLabel(frame, text=icon, width=24)
+        icon_label.pack(side="left", padx=2)
+
+        # Name (clickable for folders)
+        name_label = ctk.CTkLabel(
+            frame, text=name,
+            font=ctk.CTkFont(size=12, weight="bold" if is_dir else "normal"),
+            text_color=ACCENT_BLUE if is_dir else TEXT_PRIMARY,
+            anchor="w", cursor="hand2" if is_dir else ""
+        )
+        name_label.pack(side="left", fill="x", expand=True, padx=4)
+
+        if is_dir:
+            name_label.bind("<Button-1>", lambda e, n=name: self._open_folder(n))
+
+        # Size (for files)
+        if not is_dir and size > 0:
+            ctk.CTkLabel(
+                frame, text=format_size(size),
+                font=ctk.CTkFont(size=10), text_color=TEXT_DIM, width=70
+            ).pack(side="right", padx=8)
+
+        self._item_widgets.append(frame)
+
+    def _open_folder(self, name: str):
+        """Navigate into a folder."""
+        new_path = f"{self.current_path}/{name}" if self.current_path else name
+        self.load_directory(new_path)
+
+    def _go_back(self):
+        """Navigate to parent folder."""
+        if "/" in self.current_path:
+            parent = self.current_path.rsplit("/", 1)[0]
+        else:
+            parent = ""
+        self.load_directory(parent)
+
+    def _refresh(self):
+        """Refresh current directory."""
+        self.load_directory(self.current_path)
+
+    def _toggle_select(self, name: str, var):
+        """Toggle file/folder selection."""
+        if var.get():
+            self._selected_items.add(name)
+        else:
+            self._selected_items.discard(name)
+        self._update_selection_label()
+
+    def _select_all(self):
+        """Select all items in current view."""
+        self._selected_items = {e["name"] for e in self._current_entries}
+        self._update_selection_label()
+        # Refresh checkboxes
+        self._refresh()
+
+    def _update_selection_label(self):
+        """Update selection count display."""
+        count = len(self._selected_items)
+        if count > 0:
+            self.selection_label.configure(text=f"✓ {count} selected")
+        else:
+            self.selection_label.configure(text="")
+
+    def _clear_items(self):
+        """Clear file list."""
+        for w in self._item_widgets:
+            w.destroy()
+        self._item_widgets.clear()
+
+    def get_selected_paths(self) -> List[str]:
+        """Get full paths of selected items."""
+        paths = []
+        for name in self._selected_items:
+            if self.current_path:
+                paths.append(f"{self.current_path}/{name}")
+            else:
+                paths.append(name)
+        return paths
+
+    def get_selected_count(self) -> int:
+        return len(self._selected_items)
+
+
 class DashboardApp(ctk.CTk):
     """
-    Simple, fast dashboard.
-    Shows QR code → receives files → shows progress.
+    PC Dashboard with remote phone file explorer.
+    Browse phone files from PC → select → transfer.
     """
 
     def __init__(self):
         super().__init__()
 
         self.title("Mobile2Storage ⚡")
-        self.geometry("750x650")
-        self.minsize(650, 550)
+        self.geometry("850x700")
+        self.minsize(750, 600)
         self.configure(fg_color=DARK_BG)
 
-        # State
         self._server: Optional[ReceiverServer] = None
         self._server_thread: Optional[threading.Thread] = None
         self._destination = os.path.join(os.path.expanduser("~"), "Desktop", "Mobile2Storage")
         self._server_url = ""
-        self._file_widgets: List[ctk.CTkFrame] = []
+        self._phone_connected = False
+        self._transferring = False
 
-        # Build UI
         self._build_ui()
-
-        # Auto-start server
         self.after(500, self._start_server)
 
     def _build_ui(self):
-        """Build the simplified UI."""
-        # === HEADER ===
+        # HEADER
         header = ctk.CTkFrame(self, height=50, fg_color=CARD_BG, corner_radius=0)
         header.pack(fill="x")
         header.pack_propagate(False)
@@ -81,319 +323,245 @@ class DashboardApp(ctk.CTk):
             font=ctk.CTkFont(size=18, weight="bold")
         ).pack(side="left", padx=15, pady=10)
 
-        ctk.CTkLabel(
-            header, text="Speedy Transfer • Phone → PC",
-            font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY
-        ).pack(side="left", padx=5)
+        self.connection_badge = ctk.CTkLabel(
+            header, text="● Phone not connected",
+            font=ctk.CTkFont(size=11), text_color=ACCENT_ORANGE
+        )
+        self.connection_badge.pack(side="left", padx=10)
 
-        # Destination button
+        # Destination
         self.dest_btn = ctk.CTkButton(
             header, text=f"📂 {os.path.basename(self._destination)}",
             command=self._change_destination,
-            width=140, height=30, corner_radius=8,
+            width=140, height=28, corner_radius=8,
             font=ctk.CTkFont(size=11)
         )
-        self.dest_btn.pack(side="right", padx=15, pady=10)
+        self.dest_btn.pack(side="right", padx=15)
 
-        # === MAIN CONTENT ===
-        self.main_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.main_frame.pack(fill="both", expand=True, padx=20, pady=15)
+        # MAIN AREA
+        main = ctk.CTkFrame(self, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=12, pady=10)
 
-        # === TOP SECTION: QR Code + Instructions ===
-        self.top_section = ctk.CTkFrame(self.main_frame, fg_color=CARD_BG, corner_radius=16)
-        self.top_section.pack(fill="x", pady=(0, 12))
-
-        top_content = ctk.CTkFrame(self.top_section, fg_color="transparent")
-        top_content.pack(fill="x", padx=20, pady=20)
-
-        # Left: QR code
-        self.qr_frame = ctk.CTkFrame(top_content, fg_color="transparent", width=200)
-        self.qr_frame.pack(side="left", padx=(0, 25))
-
-        self.qr_label = ctk.CTkLabel(
-            self.qr_frame, text="Starting...",
-            font=ctk.CTkFont(size=12), text_color=TEXT_SECONDARY
-        )
-        self.qr_label.pack()
-
-        # Right: Instructions
-        instructions = ctk.CTkFrame(top_content, fg_color="transparent")
-        instructions.pack(side="left", fill="both", expand=True)
+        # Left: QR + Instructions (narrow)
+        left = ctk.CTkFrame(main, fg_color=CARD_BG, corner_radius=12, width=260)
+        left.pack(side="left", fill="y", padx=(0, 8))
+        left.pack_propagate(False)
 
         ctk.CTkLabel(
-            instructions, text="3 Steps. That's it.",
-            font=ctk.CTkFont(size=20, weight="bold"),
-            anchor="w"
-        ).pack(fill="x", pady=(0, 12))
+            left, text="📱 Connect Phone",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).pack(padx=12, pady=(12, 5), anchor="w")
 
-        steps = [
-            ("1️⃣", "Scan the QR code with your phone camera"),
-            ("2️⃣", "Select files you want to transfer"),
-            ("3️⃣", "Tap Send → Files arrive on your PC"),
-        ]
-        for icon, text in steps:
-            step_frame = ctk.CTkFrame(instructions, fg_color="transparent")
-            step_frame.pack(fill="x", pady=3)
-            ctk.CTkLabel(
-                step_frame, text=f"{icon}  {text}",
-                font=ctk.CTkFont(size=14), anchor="w"
-            ).pack(fill="x")
-
-        # Speed note
-        ctk.CTkLabel(
-            instructions,
-            text="⚡ Transfers at your full WiFi speed (no USB needed)",
-            font=ctk.CTkFont(size=11), text_color=ACCENT_GREEN, anchor="w"
-        ).pack(fill="x", pady=(12, 0))
-
-        # URL display (for manual entry if QR doesn't work)
-        self.url_frame = ctk.CTkFrame(self.top_section, fg_color="#0d1a26", corner_radius=8)
-        self.url_frame.pack(fill="x", padx=20, pady=(0, 15))
+        # QR code
+        self.qr_label = ctk.CTkLabel(left, text="Starting...")
+        self.qr_label.pack(padx=12, pady=5)
 
         self.url_label = ctk.CTkLabel(
-            self.url_frame, text="Starting server...",
-            font=ctk.CTkFont(family="Consolas", size=13, weight="bold"),
-            text_color=ACCENT_BLUE
+            left, text="", font=ctk.CTkFont(size=10),
+            text_color=ACCENT_BLUE, wraplength=230
         )
-        self.url_label.pack(pady=8)
+        self.url_label.pack(padx=12, pady=2)
 
-        # === BOTTOM SECTION: Transfer Progress ===
-        self.progress_section = ctk.CTkFrame(self.main_frame, fg_color=CARD_BG, corner_radius=16)
-        self.progress_section.pack(fill="both", expand=True)
+        # Instructions
+        steps_frame = ctk.CTkFrame(left, fg_color="#0d1a26", corner_radius=8)
+        steps_frame.pack(fill="x", padx=12, pady=10)
 
-        # Progress header
-        prog_header = ctk.CTkFrame(self.progress_section, fg_color="transparent")
-        prog_header.pack(fill="x", padx=16, pady=(12, 5))
+        for step in [
+            "1. Scan QR with phone camera",
+            "2. Tap 'Grant Storage Access'",
+            "3. Browse & transfer from here ➡️"
+        ]:
+            ctk.CTkLabel(
+                steps_frame, text=step,
+                font=ctk.CTkFont(size=11), anchor="w",
+                text_color=TEXT_SECONDARY
+            ).pack(fill="x", padx=10, pady=2)
 
-        ctk.CTkLabel(
-            prog_header, text="📥 Received Files",
-            font=ctk.CTkFont(size=14, weight="bold")
-        ).pack(side="left")
+        # Right: File Explorer + Transfer button
+        right = ctk.CTkFrame(main, fg_color="transparent")
+        right.pack(side="right", fill="both", expand=True)
 
-        self.stats_label = ctk.CTkLabel(
-            prog_header, text="Waiting for files...",
+        # File explorer (takes most space)
+        self.explorer = PhoneFileExplorer(right, None)  # Server set later
+        self.explorer.pack(fill="both", expand=True, pady=(0, 8))
+
+        # Transfer button + progress
+        bottom = ctk.CTkFrame(right, fg_color=CARD_BG, corner_radius=12, height=100)
+        bottom.pack(fill="x")
+        bottom.pack_propagate(False)
+
+        btn_row = ctk.CTkFrame(bottom, fg_color="transparent")
+        btn_row.pack(fill="x", padx=12, pady=10)
+
+        self.transfer_btn = ctk.CTkButton(
+            btn_row, text="📥 Transfer Selected to PC",
+            command=self._start_transfer, height=38,
+            corner_radius=10, font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#00aa44", hover_color="#00cc55"
+        )
+        self.transfer_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        self.progress_label = ctk.CTkLabel(
+            bottom, text="Select files/folders above, then click Transfer",
             font=ctk.CTkFont(size=11), text_color=TEXT_SECONDARY
         )
-        self.stats_label.pack(side="right")
+        self.progress_label.pack(padx=12)
 
-        # Overall progress bar (hidden until transfer starts)
-        self.overall_frame = ctk.CTkFrame(self.progress_section, fg_color="transparent")
-        self.overall_frame.pack(fill="x", padx=16, pady=4)
-
-        self.speed_label = ctk.CTkLabel(
-            self.overall_frame, text="",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=ACCENT_BLUE
-        )
-        self.speed_label.pack(anchor="w")
-
-        # File list (scrollable)
-        self.file_list = ctk.CTkScrollableFrame(
-            self.progress_section, fg_color="transparent",
-            scrollbar_button_color=TEXT_DIM
-        )
-        self.file_list.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-
-        # Placeholder text
-        self.placeholder = ctk.CTkLabel(
-            self.file_list,
-            text="📱 Files will appear here as they arrive\nfrom your phone",
-            font=ctk.CTkFont(size=13),
-            text_color=TEXT_DIM
-        )
-        self.placeholder.pack(pady=30)
-
-        # === FOOTER ===
-        footer = ctk.CTkFrame(self, height=28, fg_color=CARD_BG, corner_radius=0)
-        footer.pack(fill="x", side="bottom")
-        footer.pack_propagate(False)
-
-        self.footer_text = ctk.CTkLabel(
-            footer, text="",
-            font=ctk.CTkFont(size=10), text_color=TEXT_SECONDARY
-        )
-        self.footer_text.pack(side="left", padx=12, pady=5)
+        self.progress_bar = ctk.CTkProgressBar(bottom, height=6, corner_radius=3)
+        self.progress_bar.pack(fill="x", padx=12, pady=(4, 10))
+        self.progress_bar.set(0)
 
     def _start_server(self):
-        """Start the receiver server."""
+        """Start the server."""
         try:
             ip = get_local_ip()
             port = find_free_port()
             self._server_url = f"http://{ip}:{port}"
-
-            # Ensure destination exists
             os.makedirs(self._destination, exist_ok=True)
 
-            # Create server
             self._server = ReceiverServer(
                 port=port,
                 destination=self._destination,
                 mobile_html=MOBILE_PAGE_HTML,
-                progress_callback=self._on_progress
+                progress_callback=self._on_progress,
+                phone_ready_callback=self._on_phone_ready
             )
 
-            # Start server thread
+            # Connect explorer to server
+            self.explorer.server = self._server
+
             self._server_thread = threading.Thread(
-                target=self._server.serve_forever,
-                daemon=True
+                target=self._server.serve_forever, daemon=True
             )
             self._server_thread.start()
 
-            # Update UI with QR code
-            self._show_qr_code()
-            self.url_label.configure(text=f"📎 Or open:  {self._server_url}")
-            self.footer_text.configure(
-                text=f"Server running on {ip}:{port} • Saving to: {self._destination}"
-            )
+            # Show QR
+            self._show_qr()
+            self.url_label.configure(text=f"Or open: {self._server_url}")
 
         except Exception as e:
             self.qr_label.configure(text=f"Error: {e}", text_color=ACCENT_RED)
-            self.footer_text.configure(text=f"Failed to start server: {e}")
 
-    def _show_qr_code(self):
-        """Display QR code for the server URL."""
-        qr_image = generate_qr_for_tkinter(self._server_url, size=180)
-
+    def _show_qr(self):
+        """Show QR code."""
+        qr_image = generate_qr_for_tkinter(self._server_url, size=160)
         if qr_image:
             self.qr_label.configure(image=qr_image, text="")
-            self.qr_label._image = qr_image  # Keep reference
+            self.qr_label._image = qr_image
         else:
-            # Fallback: show URL prominently if qrcode lib not installed
             self.qr_label.configure(
-                text=f"📱 Open on phone:\n\n{self._server_url}\n\n"
-                     f"(Install 'qrcode' package\nfor QR code display)",
-                font=ctk.CTkFont(size=13, weight="bold"),
-                text_color=ACCENT_BLUE,
-                justify="center"
+                text=f"Open on phone:\n{self._server_url}",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=ACCENT_BLUE
             )
 
+    def _on_phone_ready(self):
+        """Called when phone grants access."""
+        self._phone_connected = True
+        self.after(0, self._phone_connected_ui)
+
+    def _phone_connected_ui(self):
+        """Update UI when phone connects."""
+        self.connection_badge.configure(
+            text="● Phone connected ✓", text_color=ACCENT_GREEN
+        )
+        # Load root directory
+        self.explorer.load_directory("")
+
     def _on_progress(self, stats: ServerStats):
-        """Handle progress updates from server (called from server thread)."""
+        """Update progress during transfer."""
         try:
             self.after(0, lambda: self._update_progress(stats))
         except Exception:
             pass
 
     def _update_progress(self, stats: ServerStats):
-        """Update UI with current transfer progress."""
-        # Remove placeholder on first file
-        if stats.total_files_received > 0 or stats.active_transfers > 0:
-            self.placeholder.pack_forget()
-
-        # Update stats label
-        if stats.active_transfers > 0:
-            self.stats_label.configure(
-                text=f"⚡ {stats.active_transfers} active • "
-                     f"{stats.total_files_received} complete • "
-                     f"{format_size(stats.total_bytes_received)} received"
-            )
-        elif stats.total_files_received > 0:
-            self.stats_label.configure(
-                text=f"✅ {stats.total_files_received} files • "
-                     f"{format_size(stats.total_bytes_received)} total"
+        if stats.total_files_received > 0:
+            self.progress_label.configure(
+                text=f"✅ {stats.total_files_received} files received "
+                     f"({format_size(stats.total_bytes_received)})"
             )
 
-        # Update speed
-        active_speed = sum(f.speed for f in stats.files if f.status == "receiving")
-        if active_speed > 0:
-            self.speed_label.configure(text=f"⚡ {format_speed(active_speed)}")
-        else:
-            self.speed_label.configure(text="")
-
-        # Update file list
-        self._update_file_list(stats.files)
-
-    def _update_file_list(self, files: List[FileTransfer]):
-        """Update the file list display."""
-        # Clear old widgets
-        for w in self._file_widgets:
-            w.destroy()
-        self._file_widgets.clear()
-
-        # Show files (most recent first)
-        display_files = list(reversed(files[-30:]))  # Last 30 files
-
-        for transfer in display_files:
-            frame = ctk.CTkFrame(
-                self.file_list, height=40, corner_radius=8,
-                fg_color="#1c2128" if transfer.status == "complete" else "#0d2233"
+    def _start_transfer(self):
+        """Transfer selected items from phone to PC."""
+        if not self._phone_connected:
+            messagebox.showwarning(
+                "Phone Not Connected",
+                "Scan the QR code with your phone first,\n"
+                "then tap 'Grant Storage Access'."
             )
-            frame.pack(fill="x", pady=2)
-            frame.pack_propagate(False)
+            return
 
-            # Status icon
-            if transfer.status == "complete":
-                icon = "✅"
-                color = ACCENT_GREEN
-            elif transfer.status == "receiving":
-                icon = "📤"
-                color = ACCENT_BLUE
+        selected = self.explorer.get_selected_paths()
+        if not selected:
+            messagebox.showinfo("Nothing Selected", "Select files or folders to transfer.")
+            return
+
+        self.transfer_btn.configure(state="disabled", text="Transferring...")
+        self.progress_label.configure(text=f"Transferring {len(selected)} items...")
+        self.progress_bar.set(0)
+
+        def do_transfer():
+            total = len(selected)
+            for i, path in enumerate(selected):
+                # Check if it's a directory — if so, request all files in it
+                entry = next(
+                    (e for e in self.explorer._current_entries if e["name"] == path.split("/")[-1]),
+                    None
+                )
+
+                if entry and entry["type"] == "dir":
+                    # Request transfer of entire folder
+                    self._transfer_folder(path)
+                else:
+                    # Single file
+                    self._server.request_file_transfer(path)
+
+                progress = (i + 1) / total
+                self.after(0, lambda p=progress, idx=i+1: self._update_transfer_progress(p, idx, total))
+
+            self.after(0, self._transfer_complete)
+
+        threading.Thread(target=do_transfer, daemon=True).start()
+
+    def _transfer_folder(self, folder_path: str):
+        """Recursively transfer a folder."""
+        result = self._server.list_phone_directory(folder_path)
+        entries = result.get("entries", [])
+
+        for entry in entries:
+            item_path = f"{folder_path}/{entry['name']}"
+            if entry["type"] == "dir":
+                self._transfer_folder(item_path)
             else:
-                icon = "❌"
-                color = ACCENT_RED
+                self._server.request_file_transfer(item_path)
 
-            ctk.CTkLabel(
-                frame, text=icon, width=28,
-                font=ctk.CTkFont(size=14)
-            ).pack(side="left", padx=6)
+    def _update_transfer_progress(self, progress: float, current: int, total: int):
+        self.progress_bar.set(progress)
+        self.progress_label.configure(text=f"Transferring... {current}/{total} items")
 
-            # File info
-            info = ctk.CTkFrame(frame, fg_color="transparent")
-            info.pack(side="left", fill="both", expand=True, padx=4)
-
-            name = transfer.filename
-            if len(name) > 40:
-                name = name[:37] + "..."
-
-            ctk.CTkLabel(
-                info, text=name,
-                font=ctk.CTkFont(size=11), anchor="w",
-                text_color=TEXT_PRIMARY
-            ).pack(fill="x", side="top")
-
-            # Progress bar for active transfers
-            if transfer.status == "receiving" and transfer.total_size > 0:
-                progress = transfer.received_size / transfer.total_size
-                bar = ctk.CTkProgressBar(info, height=4, corner_radius=2)
-                bar.pack(fill="x", side="bottom", pady=(0, 3))
-                bar.set(progress)
-
-            # Size + speed
-            if transfer.status == "receiving":
-                pct = int(transfer.received_size / max(1, transfer.total_size) * 100)
-                right_text = f"{pct}% • {format_speed(transfer.speed)}"
-            else:
-                right_text = format_size(transfer.received_size)
-
-            ctk.CTkLabel(
-                frame, text=right_text,
-                font=ctk.CTkFont(size=10), text_color=color,
-                width=120
-            ).pack(side="right", padx=8)
-
-            self._file_widgets.append(frame)
+    def _transfer_complete(self):
+        self.transfer_btn.configure(state="normal", text="📥 Transfer Selected to PC")
+        self.progress_bar.set(1.0)
+        self.progress_label.configure(
+            text=f"✅ Transfer complete! Files saved to: {os.path.basename(self._destination)}"
+        )
 
     def _change_destination(self):
-        """Change save destination folder."""
-        path = filedialog.askdirectory(title="Choose where to save files")
+        path = filedialog.askdirectory(title="Choose save location")
         if path:
             self._destination = path
             if self._server:
                 self._server.destination_path = path
             self.dest_btn.configure(text=f"📂 {os.path.basename(path)}")
-            self.footer_text.configure(
-                text=f"Server running • Saving to: {path}"
-            )
 
     def on_closing(self):
-        """Handle window close."""
         if self._server:
             self._server.shutdown()
         self.destroy()
 
 
 def main():
-    """Entry point."""
     app = DashboardApp()
     app.protocol("WM_DELETE_WINDOW", app.on_closing)
     app.mainloop()

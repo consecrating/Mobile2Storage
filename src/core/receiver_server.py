@@ -61,6 +61,8 @@ class UploadHandler(BaseHTTPRequestHandler):
             self._serve_upload_page()
         elif self.path == "/status":
             self._serve_status()
+        elif self.path == "/phone-command":
+            self._serve_phone_command()
         elif self.path == "/favicon.ico":
             self.send_response(204)
             self.end_headers()
@@ -74,6 +76,10 @@ class UploadHandler(BaseHTTPRequestHandler):
             self._handle_upload()
         elif self.path == "/upload-chunk":
             self._handle_chunked_upload()
+        elif self.path == "/phone-ready":
+            self._handle_phone_ready()
+        elif self.path == "/phone-response":
+            self._handle_phone_response()
         else:
             self.send_response(404)
             self.end_headers()
@@ -108,12 +114,52 @@ class UploadHandler(BaseHTTPRequestHandler):
             "bytes_received": stats.total_bytes_received,
             "active": stats.active_transfers,
             "speed": stats.current_speed,
+            "phone_connected": self.server.phone_connected,
         })
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self._set_cors_headers()
         self.end_headers()
         self.wfile.write(data.encode())
+
+    def _serve_phone_command(self):
+        """Phone polls this to get commands from PC."""
+        # Get next command from queue (or empty response)
+        cmd = self.server.get_next_command()
+        data = json.dumps(cmd) if cmd else json.dumps({})
+        status = 200 if cmd else 204
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self._set_cors_headers()
+        self.end_headers()
+        if cmd:
+            self.wfile.write(data.encode())
+
+    def _handle_phone_ready(self):
+        """Phone signals it's ready to serve files."""
+        self.server.phone_connected = True
+        if self.server.phone_ready_callback:
+            self.server.phone_ready_callback()
+        self.send_response(200)
+        self._set_cors_headers()
+        self.end_headers()
+        self.wfile.write(b'{"ok":true}')
+
+    def _handle_phone_response(self):
+        """Phone sends response to a command."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        try:
+            data = json.loads(body)
+            cmd_id = data.get("id", "")
+            response_data = data.get("data", {})
+            self.server.set_response(cmd_id, response_data)
+        except (json.JSONDecodeError, KeyError):
+            pass
+        self.send_response(200)
+        self._set_cors_headers()
+        self.end_headers()
+        self.wfile.write(b'{"ok":true}')
 
     def _handle_upload(self):
         """Handle a direct file upload (for smaller files)."""
@@ -344,14 +390,24 @@ class UploadHandler(BaseHTTPRequestHandler):
 class ReceiverServer(HTTPServer):
     """
     Enhanced HTTP server for receiving files from mobile devices.
+    Also handles PC↔Phone command protocol for remote file browsing.
     """
 
     def __init__(self, port: int, destination: str, mobile_html: str,
-                 progress_callback: Optional[Callable] = None):
+                 progress_callback: Optional[Callable] = None,
+                 phone_ready_callback: Optional[Callable] = None):
         self.destination_path = destination
         self.mobile_page_html = mobile_html
         self.progress_callback = progress_callback
+        self.phone_ready_callback = phone_ready_callback
         self.stats = ServerStats()
+        self.phone_connected = False
+        
+        # Command queue: PC puts commands, phone polls them
+        self._command_queue = []
+        self._responses = {}  # cmd_id -> response data
+        self._cmd_lock = threading.Lock()
+        self._response_events = {}  # cmd_id -> threading.Event
         
         # Bind to all interfaces
         super().__init__(("0.0.0.0", port), UploadHandler)
@@ -359,6 +415,53 @@ class ReceiverServer(HTTPServer):
 
     def get_stats(self) -> ServerStats:
         return self.stats
+    
+    def send_command(self, action: str, **kwargs) -> dict:
+        """Send a command to phone and wait for response (blocking)."""
+        import uuid
+        cmd_id = str(uuid.uuid4())[:8]
+        cmd = {"id": cmd_id, "action": action, **kwargs}
+        
+        event = threading.Event()
+        with self._cmd_lock:
+            self._command_queue.append(cmd)
+            self._response_events[cmd_id] = event
+        
+        # Wait for phone to respond (timeout 30s)
+        event.wait(timeout=30)
+        
+        with self._cmd_lock:
+            response = self._responses.pop(cmd_id, {})
+            self._response_events.pop(cmd_id, None)
+        
+        return response
+    
+    def get_next_command(self) -> Optional[dict]:
+        """Get next command for phone (called by phone polling)."""
+        with self._cmd_lock:
+            if self._command_queue:
+                return self._command_queue.pop(0)
+        return None
+    
+    def set_response(self, cmd_id: str, data: dict):
+        """Store phone response and signal waiting thread."""
+        with self._cmd_lock:
+            self._responses[cmd_id] = data
+            event = self._response_events.get(cmd_id)
+            if event:
+                event.set()
+    
+    def list_phone_directory(self, path: str = "") -> dict:
+        """Ask phone to list a directory. Returns {entries: [...], path: '...'}"""
+        if not self.phone_connected:
+            return {"entries": [], "path": path, "error": "Phone not connected"}
+        return self.send_command("list", path=path)
+    
+    def request_file_transfer(self, path: str) -> dict:
+        """Ask phone to send a specific file."""
+        if not self.phone_connected:
+            return {"success": False, "error": "Phone not connected"}
+        return self.send_command("send", path=path)
 
 
 def get_local_ip() -> str:
